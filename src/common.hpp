@@ -25,6 +25,7 @@ void UpscalerInit();
 void UpscalerShutdown();
 bool UpscalerOnDraw(reshade::api::command_list* cl, uint32_t vertices, uint32_t instances);  // true: draw replaced
 bool UpscalerOnDispatch(reshade::api::command_list* cl);  // true: dispatch replaced
+void UpscalerBeforeDraw(reshade::api::command_list* cl);  // other draws: ends a redirect
 void UpscalerPresent(reshade::api::swapchain* sc);
 void UpscalerOverlay();
 

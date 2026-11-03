@@ -172,6 +172,10 @@ struct __declspec(uuid("8b3e5d71-2c4a-4f09-9e6d-1a7b3c5e9f20")) ListState {
     bool hasVp = false;
     rect scissor = {};
     bool hasScissor = false;
+    // A game draw was redirected to output size (target, viewport, SceneInfo): the game's own
+    // state is put back before the next draw we don't handle, so nothing else is drawn with ours
+    // (from RE3DLSS, where an unrecognised pass after a redirect drew a zoomed-in picture).
+    bool redirected = false;
 };
 
 ListState* State(command_list* cl) { return cl->get_private_data<ListState>(); }
@@ -616,11 +620,12 @@ bool OnTaa(command_list* cl, ListState& s) {
 // state is put back at that stretch (OnFinalCompute).
 
 // Bloom (additive, texture coordinates): the game's draw goes into X.
-void OnBloom(command_list* cl, ListState&) {
+void OnBloom(command_list* cl, ListState& s) {
     std::lock_guard<std::mutex> lock(g_resMutex);
     if (!g_up.active || g_up.bloomDone || !g_x.rtv.handle) return;
     Transition(cl, g_x, resource_usage::render_target);
     BindFullTarget(cl, g_x.rtv, g_x.w, g_x.h);
+    s.redirected = true;
     g_up.bloomDone = true;
 }
 
@@ -668,7 +673,10 @@ bool RedrawAtOutputSize(command_list* cl, ListState& s, uint32_t reg, Texture& s
         cl->push_descriptors(s.graphics.roots.at(param).stages, s.graphics.layout, param, cu);
     }
     BindFullTarget(cl, dst.rtv, dst.w, dst.h);
-    if (inPlace) return true;  // the game's draw runs next, into dst
+    if (inPlace) {  // the game's draw runs next, into dst; its state comes back before the one after
+        s.redirected = true;
+        return true;
+    }
     cl->draw(3, 1, 0, 0);
     Restore(cl, s);  // puts the game's SceneInfo back
     RestoreTargets(cl, s);
@@ -845,6 +853,7 @@ bool OnFinalCompute(command_list* cl, ListState& s) {
     cl->barrier(target, resource_usage::render_target, resource_usage::unordered_access);  // as the dispatch left it
     Restore(cl, s);
     RestoreTargets(cl, s);
+    s.redirected = false;  // everything is the game's again
     g_up.active = false;
     return true;
 }
@@ -973,10 +982,23 @@ bool UpscalerOnDispatch(command_list* cl) {
     return OnFinalCompute(cl, *s);
 }
 
+// Puts the game's own targets, viewport and bindings back after a redirected draw.
+void EndRedirect(command_list* cl, ListState& s) {
+    if (!s.redirected) return;
+    s.redirected = false;
+    Restore(cl, s);
+    RestoreTargets(cl, s);
+}
+
+void UpscalerBeforeDraw(command_list* cl) {
+    if (ListState* s = State(cl)) EndRedirect(cl, *s);
+}
+
 bool UpscalerOnDraw(command_list* cl, uint32_t vertices, uint32_t instances) {
-    if (!g_set.enabled || vertices != 3 || instances != 1) return false;
     ListState* s = State(cl);
     if (!s) return false;
+    EndRedirect(cl, *s);
+    if (!g_set.enabled || vertices != 3 || instances != 1) return false;
     switch (PipelinePs(s->pipe)) {
         case kTaaPs: return OnTaa(cl, *s);
         case kBloomPs: OnBloom(cl, *s); return false;

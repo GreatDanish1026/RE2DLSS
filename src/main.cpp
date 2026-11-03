@@ -812,6 +812,7 @@ bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, u
 }
 
 bool OnDrawIndexed(command_list* cl, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
+    rd::UpscalerBeforeDraw(cl);
     if (!Recording()) return false;
     if (indices <= 6 && instances == 1) {
         Pass(cl, false, Format("draw %u indices", indices));
@@ -828,6 +829,7 @@ bool OnDispatchMesh(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
 }
 
 bool OnExecuteIndirect(command_list* cl, indirect_command type, resource, uint64_t, uint32_t count, uint32_t) {
+    if (type != indirect_command::dispatch) rd::UpscalerBeforeDraw(cl);
     if (!Recording()) return false;
     if (type == indirect_command::dispatch) Pass(cl, true, Format("indirect x%u", count));
     else Add(cl, Format("indirect type %u count %u", static_cast<uint32_t>(type), count));
