@@ -604,15 +604,19 @@ bool OnTaa(command_list* cl, ListState& s) {
     return replaced;
 }
 
-// Bloom: the game's draw adds the bloom to its render-size TAA output; the same draw (additive,
-// texture coordinates) is recorded once more into X first.
-void OnBloom(command_list* cl, ListState& s) {
+// The bloom and tonemap passes are redirected in place: their state is changed and the game's own
+// draw then runs at output size. Drawing them a second time from here (as VillageDLSS does) loses
+// RenoDX's per-draw settings when this add-on's callbacks run before RenoDX's (RE2DLSS sorts before
+// renodx-*: washed-out image in 0.1.0). The render-size results aren't needed: the tonemap reads
+// the output-size image, and its render-size target only feeds the stretch we replace. The game's
+// state is put back at that stretch (OnFinalCompute).
+
+// Bloom (additive, texture coordinates): the game's draw goes into X.
+void OnBloom(command_list* cl, ListState&) {
     std::lock_guard<std::mutex> lock(g_resMutex);
     if (!g_up.active || g_up.bloomDone || !g_x.rtv.handle) return;
     Transition(cl, g_x, resource_usage::render_target);
     BindFullTarget(cl, g_x.rtv, g_x.w, g_x.h);
-    cl->draw(3, 1, 0, 0);
-    RestoreTargets(cl, s);
     g_up.bloomDone = true;
 }
 
@@ -620,7 +624,9 @@ void OnBloom(command_list* cl, ListState& s) {
 // register t<reg> rewritten (in its descriptor table) to src, SceneInfo replaced by a copy with
 // the output size, render target dst (created like the game's target). The game's render-size
 // draw is skipped. g_resMutex held.
-bool RedrawAtOutputSize(command_list* cl, ListState& s, uint32_t reg, Texture& src, Texture& dst, const char* name) {
+// inPlace: set everything up and return, so the game's own draw runs at output size (see above).
+bool RedrawAtOutputSize(command_list* cl, ListState& s, uint32_t reg, Texture& src, Texture& dst, const char* name,
+                        bool inPlace = false) {
     device* dev = cl->get_device();
     Slot slot;
     float scene[kSceneInfoFloats];
@@ -658,20 +664,21 @@ bool RedrawAtOutputSize(command_list* cl, ListState& s, uint32_t reg, Texture& s
         cl->push_descriptors(s.graphics.roots.at(param).stages, s.graphics.layout, param, cu);
     }
     BindFullTarget(cl, dst.rtv, dst.w, dst.h);
+    if (inPlace) return true;  // the game's draw runs next, into dst
     cl->draw(3, 1, 0, 0);
     Restore(cl, s);  // puts the game's SceneInfo back
     RestoreTargets(cl, s);
     return true;
 }
 
-// Tonemap (reads t1) at output size into Y, from X.
+// Tonemap (reads t0) at output size into Y, from X: the game's draw, redirected.
 bool OnTonemap(command_list* cl, ListState& s) {
     std::lock_guard<std::mutex> lock(g_resMutex);
     if (!g_up.active || g_up.tonemapDone || !g_x.srv.handle) return false;
-    if (!RedrawAtOutputSize(cl, s, kTonemapColor, g_x, g_y, "tonemapped")) return false;
+    if (!RedrawAtOutputSize(cl, s, kTonemapColor, g_x, g_y, "tonemapped", true)) return false;
     g_up.tonemapDone = true;
     g_up.final = &g_y;
-    return true;
+    return false;  // the game's draw runs, at output size
 }
 
 // The game's sharpening (Sharpness_PS, reads t0, the game's Sharpness setting) at output size
