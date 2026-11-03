@@ -42,3 +42,13 @@ it can't be redrawn at output size) and LightShaftBilateralBlurYPS (pse9c57eca).
 DLSS -> X, NewFinal redrawn into X, tonemap redrawn at output size into Y, CAS_CS skipped and Y
 drawn into its u0 (own RTV + blit). Motion blur and CAS sharpening aren't applied on the
 output-size path.
+
+## 0.1.1 (confirmed 2026-11-03)
+
+0.1.0 drew its own output-size tonemap from the draw callback and the image came out washed out
+(yellow-grey, HUD fine). RenoDX replaces the tonemap and sets its own per-draw values; RE2DLSS's
+callbacks run before renodx-*'s (alphabetical), so the separate draw ran without them. 0.1.1
+redirects the game's own NewFinal and tonemap draws to output size (target, viewport, t0 slot,
+SceneInfo) and lets them run; the state is put back at CAS_CS. User: looks right. Log: every
+DLSS mode via the dropdown (RE2DLSS.lua works in RE2): 2561x1440, 2227x1252, 1920x1080,
+1278x719 -> 3840x2160 and DLAA 3840x2160, no fallbacks.
