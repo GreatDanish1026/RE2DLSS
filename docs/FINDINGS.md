@@ -1,0 +1,30 @@
+# Resident Evil 2 frame analysis
+
+Game: Steam, re2.exe (RT version), D3D12, 3840x2160 HDR10 (rgb10a2, colour space 3), ReShade
+6.8.0, REFramework, RenoDX (same add-on as Village). Village's analysis: VILLAGE-FINDINGS.md.
+VillageDLSS's shader ids don't match RE2 (no DLSS ran with the fork as it was).
+
+## Post chain (captures: frame-1 = 100%, frame-2 = about 50%, 1920x1080 -> 3840x2160)
+
+All at render size, in order:
+
+| Pass | Shader | Reads | Writes |
+|---|---|---|---|
+| colour compose | pse9c57eca | t0 rgba16f | colour #de70a rgba16f, r8 mask |
+| **TAA** | **ps89b84994** | t0 r8 mask, **t1 depth** r32g8x24, **t2 colour**, **t3 history**, **t4 velocity** rgba16snorm; root CBVs b0 (SceneInfo), b1 | rgba16f #dec6b |
+| history copy | copy | TAA output | history |
+| motion blur | ps1d41534e | t0 60x34 tiles, t1 1920x1080 tiles (fmt31), **t2 TAA output** | #de70a |
+| bloom down/up | ps4f9b2ee4, ps2f250338 x6, ps85f5ecb8 .. ps8c6acf6e | #de70a | 960x540 .. 15x8 |
+| bloom composite | psdd975721 | t0 bloom 960x540 | into #de70a (additive) |
+| **tonemap** | **ps0936c4dc** (b4..b10 CBVs, LUTs) | **t0 colour** #de70a | #dec6b rgba16f |
+| **stretch to output** | **csa2614017** (compute, 240x135) | t0 #dec6b | **u0 3840x2160 rgba16f** #9a4c3 |
+| HUD | ps170402b7 (5-index quads) | | #9a4c3 |
+| output | ps6769b8ed | | back buffer rgb10a2 |
+
+At 100% there's no stretch: the tonemap writes the 3840x2160 target itself. No separate
+sharpening pass in these captures (Village had Sharpness_PS).
+
+Differences from Village: TAA registers shifted (t1 depth, t2 colour, t3 history, t4 velocity),
+a motion blur pass between TAA and bloom, the tonemap reads t0, and the final stretch is a
+compute pass writing a UAV. Next: bytecode of these passes (DumpShaders) to check the velocity and
+jitter conventions and how motion blur and tonemap compute screen positions.
