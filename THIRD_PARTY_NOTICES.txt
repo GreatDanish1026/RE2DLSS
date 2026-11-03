@@ -1,7 +1,7 @@
 Third-party notices
 ===================
 
-VillageDLSS.addon64 is compiled against the following headers, which are
+RE2DLSS.addon64 is compiled against the following headers, which are
 included in the source repository under third_party/.
 
 ----------------------------------------------------------------------------
@@ -61,8 +61,8 @@ This software contains source code provided by NVIDIA Corporation.
 
 
 
-The VillageDLSS release zip redistributes NVIDIA's signed DLSS runtime,
+The RE2DLSS release zip redistributes NVIDIA's signed DLSS runtime,
 nvngx_dlss.dll 310.9.16 (from bin\x64 of NVIDIA's Streamline SDK 2.14.16
 release), unmodified, under the NVIDIA RTX SDKs license (NVIDIA-DLSS-LICENSE.txt
-in the zip's VillageDLSS-licenses folder). It is not part of the source
+in the zip's RE2DLSS-licenses folder). It is not part of the source
 repository.

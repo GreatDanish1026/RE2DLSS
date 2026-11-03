@@ -1,9 +1,12 @@
 # Builds bin\RE2DLSS.addon64 with MSVC (Visual Studio 2022+ with C++ tools).
-# Usage: .\build.ps1 [-Install] [-GameDir <folder of re2.exe>]
+# Usage: .\build.ps1 [-Install] [-Package] [-GameDir <folder of re2.exe>]
 #   -Install  copies the add-on, nvngx_dlss.dll and the REFramework script into the game folder
 #             (game closed).
+#   -Package  makes bin\release\RE2DLSS-<version>.zip for Fluffy Mod Manager: one folder,
+#             RE2DLSS, with modinfo.ini and the files laid out as they go in the game folder.
 param(
     [switch]$Install,
+    [switch]$Package,
     [string]$GameDir = "E:\SteamLibrary\steamapps\common\RESIDENT EVIL 2  BIOHAZARD RE2"
 )
 $ErrorActionPreference = 'Stop'
@@ -49,4 +52,49 @@ if ($Install) {
         Copy-Item "$root\reframework\RE2DLSS.lua" "$GameDir\reframework\autorun" -Force
     } else { Write-Warning "REFramework not installed: the DLSS mode dropdown needs it" }
     Write-Host "Installed to $GameDir"
+}
+
+if ($Package) {
+    $version = [regex]::Match((Get-Content "$root\src\version.h" -Raw), 'RD_VERSION "([^"]+)"').Groups[1].Value
+    $ngx = "$root\third_party\bin\nvngx_dlss.dll"
+    if (-not (Test-Path $ngx)) { throw "nvngx_dlss.dll not found in third_party\bin" }
+    $stage = "$root\bin\release\RE2DLSS-$version"
+    $mod = "$stage\RE2DLSS"
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force "$mod\reframework\autorun", "$mod\RE2DLSS-licenses" | Out-Null
+
+    # Files installed into the game folder (where re2.exe is).
+    Copy-Item $addon, $ngx $mod
+    Copy-Item "$root\reframework\RE2DLSS.lua" "$mod\reframework\autorun"
+    Copy-Item "$root\README.md" "$mod\RE2DLSS-README.md"
+    Copy-Item "$root\THIRD_PARTY_NOTICES.txt" "$mod\RE2DLSS-THIRD_PARTY_NOTICES.txt"
+    Copy-Item "$root\LICENSE" "$mod\RE2DLSS-licenses\RE2DLSS-LICENSE.txt"
+    Copy-Item "$root\third_party\dlss\LICENSE.txt" "$mod\RE2DLSS-licenses\NVIDIA-DLSS-LICENSE.txt"
+    Copy-Item "$root\third_party\reshade\LICENSE.md" "$mod\RE2DLSS-licenses\ReShade-LICENSE.md"
+
+    # Fluffy Mod Manager's mod information (key=value, one per line).
+    @(
+        "name=RE2DLSS - DLSS for Resident Evil 2",
+        "version=v$version",
+        "description=Replaces the game's TAA with NVIDIA DLSS: DLAA, or DLSS upscaling from Quality to Performance with the game's bloom and tonemapping (RenoDX HDR works) and HUD on top at full resolution. Needs an NVIDIA RTX card, ReShade 6.8+ with add-on support, and REFramework for the DLSS mode dropdown. Settings: ReShade overlay (Home), Add-ons tab, RE2DLSS; F9 switches DLSS on and off.",
+        "author=Scott Dinwiddie"
+    ) | Set-Content "$mod\modinfo.ini" -Encoding ascii
+
+    # Zip with forward-slash entry names (Compress-Archive in PowerShell 5.1 writes backslashes,
+    # which some tools mishandle).
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zip = "$root\bin\release\RE2DLSS-$version.zip"
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    $archive = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Get-ChildItem $stage -Recurse -File | ForEach-Object {
+            $entry = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entry,
+                [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $archive.Dispose() }
+    Write-Host "Packaged $zip"
+    Get-ChildItem $stage -Recurse -File | ForEach-Object {
+        "{0,-60} {1,12:N0}" -f $_.FullName.Substring($stage.Length + 1), $_.Length
+    }
 }

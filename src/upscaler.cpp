@@ -1,25 +1,28 @@
 // DLSS in place of the game's TAA (docs/FINDINGS.md).
 //
-// The TAA pass (pixel shader pscf113c28) is a full-screen draw reading t0 depth (reverse-Z), t1
-// the scene colour before exposure, t2 last frame's TAA output and t3 the velocity (NDC offset
-// from the current to the previous position, y up), with the camera constants (SceneInfo) in
-// root CBV b0. DLSS takes the same inputs:
+// Resident Evil 2, forked from VillageDLSS (the post chain is the same shaders; ids below).
+//
+// The TAA pass (PreTonemap2_PS) is a full-screen draw reading depth (reverse-Z), the scene colour
+// before exposure, last frame's TAA output and the velocity (NDC offset from the current to the
+// previous position, y up), with the camera constants (SceneInfo) in root CBV b0. DLSS takes the
+// same inputs:
 //   - motion vectors: the game's velocity texture as it is, scaled by (0.5 w, -0.5 h) to pixels;
 //   - jitter: SceneInfo.projElement[0].zw (clip space) times half the render size.
 //
 // DLAA (render size = TAA target size, Image Quality 1.0 or above): the TAA draw is skipped and
 // DLSS's output is copied into the TAA target. Everything after it runs as the game does.
 //
-// Upscaling (render size below the output size): everything after TAA runs at render size, and
-// one pass (CopyImageWithDepthPS) stretches it to the output and writes a full-size depth. So:
+// Upscaling (render size below the output size): everything after TAA runs at render size, and a
+// compute pass (CAS_CS, FidelityFX CAS) stretches it to the output. So:
 //   1. TAA: DLSS writes an output-size image (X). The game's TAA still runs at render size, so
-//      its bloom input and TAA history stay as they are.
-//   2. Bloom composite (NewFinal, additive, texture coordinates): drawn again into X.
-//   3. Tonemap (LDRPostProcess_WithTonemap): reads t1 by pixel position and SceneInfo's screen
-//      size, so it's drawn only at output size, into Y: t1 rewritten to X in its descriptor
-//      table, SceneInfo replaced by a copy with the output size. The render-size tonemap and the
-//      sharpening after it are unused then.
-//   4. CopyImageWithDepthPS: the game's draw (for its depth), then Y copied over its colour.
+//      the passes after it at render size and the TAA history stay as they are.
+//   2. Motion blur (MotionBlur_ReconstructPS) reads render-size tiles by pixel position, so it's
+//      left out of the output-size image.
+//   3. Bloom composite (NewFinal, additive): the game's draw goes into X.
+//   4. Tonemap (LDRPostProcess_WithTonemap): reads t0 by pixel position and SceneInfo's screen
+//      size: the game's draw goes into Y at output size, t0 rewritten to X in its descriptor
+//      table, SceneInfo replaced by a copy with the output size.
+//   5. CAS_CS is skipped and Y is drawn into its output (our pass converts formats).
 // The HUD and the final output pass (and RenoDX) follow as usual.
 //
 // NGX records its own compute state and descriptor heaps on the game's command list, so the
