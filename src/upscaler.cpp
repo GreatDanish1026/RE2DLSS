@@ -1,4 +1,4 @@
-﻿// DLSS in place of the game's TAA (docs/FINDINGS.md).
+// DLSS in place of the game's TAA (docs/FINDINGS.md).
 //
 // The TAA pass (pixel shader pscf113c28) is a full-screen draw reading t0 depth (reverse-Z), t1
 // the scene colour before exposure, t2 last frame's TAA output and t3 the velocity (NDC offset
@@ -53,11 +53,15 @@ using namespace reshade::api;
 namespace rd {
 namespace {
 
-constexpr uint32_t kTaaPs = 0xcf113c28;      // PreTonemap2_PS
-constexpr uint32_t kBloomPs = 0x77ae4c63;    // NewFinal
-constexpr uint32_t kTonemapPs = 0x3cc6333b;  // LDRPostProcess_WithTonemap
-constexpr uint32_t kCopyPs = 0x48155d5e;     // CopyImageWithDepthPS
-constexpr uint32_t kSharpenPs = 0x8195a264;  // Sharpness_PS
+// Resident Evil 2's shaders (docs/FINDINGS.md); the names are the same as Village's.
+constexpr uint32_t kTaaPs = 0x89b84994;      // PreTonemap2_PS: t1 depth, t2 colour, t3 history, t4 velocity
+constexpr uint32_t kTaaDepth = 1, kTaaColor = 2, kTaaMotion = 4;
+constexpr uint32_t kBloomPs = 0xdd975721;    // NewFinal
+constexpr uint32_t kTonemapPs = 0x0936c4dc;  // LDRPostProcess_WithTonemap (colour t0)
+constexpr uint32_t kTonemapColor = 0;
+constexpr uint32_t kCopyPs = 1;               // CopyImageWithDepthPS: not used in RE2
+constexpr uint32_t kSharpenPs = 2;            // Sharpness_PS: not used in RE2
+constexpr uint32_t kFinalCs = 0xa2614017;    // CAS_CS: FidelityFX CAS, stretches (and sharpens) to output size, u0
 constexpr int kToggleHotkey = VK_F9;
 
 // SceneInfo (cb0 of the TAA and tonemap shaders), as float indices.
@@ -507,9 +511,9 @@ void UnpatchAll(device* dev) {
 
 bool OnTaa(command_list* cl, ListState& s) {
     device* dev = cl->get_device();
-    const resource depth = PixelSrv(dev, s.graphics, 0);
-    const resource color = PixelSrv(dev, s.graphics, 1);
-    const resource motion = PixelSrv(dev, s.graphics, 3);
+    const resource depth = PixelSrv(dev, s.graphics, kTaaDepth);
+    const resource color = PixelSrv(dev, s.graphics, kTaaColor);
+    const resource motion = PixelSrv(dev, s.graphics, kTaaMotion);
     const resource target = ViewResource(s.rtvs[0]);
     if (!depth.handle || !color.handle || !motion.handle || !target.handle) {
         Fail("TAA inputs not found (depth, colour, velocity or render target)");
@@ -664,7 +668,7 @@ bool RedrawAtOutputSize(command_list* cl, ListState& s, uint32_t reg, Texture& s
 bool OnTonemap(command_list* cl, ListState& s) {
     std::lock_guard<std::mutex> lock(g_resMutex);
     if (!g_up.active || g_up.tonemapDone || !g_x.srv.handle) return false;
-    if (!RedrawAtOutputSize(cl, s, 1, g_x, g_y, "tonemapped")) return false;
+    if (!RedrawAtOutputSize(cl, s, kTonemapColor, g_x, g_y, "tonemapped")) return false;
     g_up.tonemapDone = true;
     g_up.final = &g_y;
     return true;
@@ -766,7 +770,78 @@ bool OnCopy(command_list* cl, ListState& s) {
     return true;
 }
 
+// RE2's stretch to output size is a compute pass (CAS_CS, u0 = the output-size target the HUD is
+// drawn into). When upscaling, it's skipped and the output-size image is drawn into that target
+// with our own pass (it converts formats), through a render target view of our own.
+
+std::map<uint64_t, resource_view> g_targetRtvs;  // by resource; g_resMutex
+
+resource ComputeUav(device* dev, const StageState& st, uint32_t reg) {
+    descriptor_tracking* dt = dev->get_private_data<descriptor_tracking>();
+    if (!dt) return {0};
+    for (uint32_t i = 0; i < st.tables.size(); ++i) {
+        if (!st.tables[i].handle) continue;
+        const pipeline_layout_param p = dt->get_pipeline_layout_param(st.layout, i);
+        if (p.type != pipeline_layout_param_type::descriptor_table || !p.descriptor_table.ranges) continue;
+        for (uint32_t r = 0; r < p.descriptor_table.count; ++r) {
+            const descriptor_range& range = p.descriptor_table.ranges[r];
+            const bool uav = range.type == descriptor_type::unordered_access_view ||
+                             range.type == descriptor_type::texture_unordered_access_view;
+            if (!uav || range.dx_register_space != 0) continue;
+            if (reg < range.dx_register_index || reg - range.dx_register_index >= range.count) continue;
+            descriptor_heap heap = {0};
+            uint32_t offset = 0;
+            dev->get_descriptor_heap_offset(st.tables[i], range.binding + (reg - range.dx_register_index), 0, &heap,
+                                            &offset);
+            return ViewResource(dt->get_resource_view(heap, offset));
+        }
+    }
+    return {0};
+}
+
+bool OnFinalCompute(command_list* cl, ListState& s) {
+    std::lock_guard<std::mutex> lock(g_resMutex);
+    if (!g_up.active || !g_up.tonemapDone || !g_up.final || !g_up.final->srv.handle) return false;
+    Texture& src = *g_up.final;
+    device* dev = cl->get_device();
+    const resource target = ComputeUav(dev, s.compute, 0);
+    if (!target.handle) return false;
+    const resource_desc td = dev->get_resource_desc(target);
+    const pipeline blit = BlitPipeline(dev, td.texture.format);
+    resource_view& rtv = g_targetRtvs[target.handle];
+    if (!rtv.handle && (td.usage & resource_usage::render_target) != 0)
+        dev->create_resource_view(target, resource_usage::render_target,
+                                  resource_view_desc(resource_view_type::texture_2d, td.texture.format, 0, 1, 0, 1), &rtv);
+    if (td.texture.width < src.w || td.texture.height < src.h || !blit.handle || !rtv.handle) {
+        Fail("output target " + std::to_string(td.texture.width) + "x" + std::to_string(td.texture.height) + " format " +
+             std::to_string(static_cast<unsigned>(td.texture.format)) + " doesn't take the " + std::to_string(src.w) +
+             "x" + std::to_string(src.h) + " image: game's upscaling used");
+        return false;
+    }
+    Transition(cl, src, resource_usage::shader_resource);
+    cl->barrier(target, resource_usage::unordered_access, resource_usage::render_target);
+    cl->bind_pipeline(pipeline_stage::all_graphics, blit);
+    const dynamic_state topoState = dynamic_state::primitive_topology;
+    const uint32_t topo = static_cast<uint32_t>(primitive_topology::triangle_list);
+    cl->bind_pipeline_states(1, &topoState, &topo);
+    descriptor_table_update u = {};
+    u.count = 1;
+    u.type = descriptor_type::texture_shader_resource_view;
+    u.descriptors = &src.srv;
+    cl->push_descriptors(shader_stage::pixel, g_blitLayout, 0, u);
+    BindFullTarget(cl, rtv, src.w, src.h);
+    cl->draw(3, 1, 0, 0);
+    cl->barrier(target, resource_usage::render_target, resource_usage::unordered_access);  // as the dispatch left it
+    Restore(cl, s);
+    RestoreTargets(cl, s);
+    g_up.active = false;
+    return true;
+}
+
 void DestroyAll(device* dev) {
+    for (auto& [res, rtv] : g_targetRtvs)
+        if (rtv.handle) dev->destroy_resource_view(rtv);
+    g_targetRtvs.clear();
     dlss::Shutdown();
     for (Texture* t : {&g_x, &g_y, &g_z}) Retire(*t);
     for (Old& o : g_old) {
@@ -880,6 +955,13 @@ bool g_samplerStatsLogged = false;
 
 }  // namespace
 
+bool UpscalerOnDispatch(command_list* cl) {
+    if (!g_set.enabled) return false;
+    ListState* s = State(cl);
+    if (!s || PipelinePs(s->pipe) != kFinalCs) return false;
+    return OnFinalCompute(cl, *s);
+}
+
 bool UpscalerOnDraw(command_list* cl, uint32_t vertices, uint32_t instances) {
     if (!g_set.enabled || vertices != 3 || instances != 1) return false;
     ListState* s = State(cl);
@@ -952,7 +1034,7 @@ void UpscalerOverlay() {
         g_set.preset = idx == 1 ? 10 : idx == 2 ? 11 : 0;
         changed = true;
     }
-    changed |= ImGui::Checkbox("Game sharpening at output size", &g_set.sharpen);
+    if (kSharpenPs > 2) changed |= ImGui::Checkbox("Game sharpening at output size", &g_set.sharpen);
     changed |= ImGui::Checkbox("Sharper textures at lower render sizes (needs a restart)", &g_set.textureDetail);
     ImGui::TextDisabled("Texture mip bias now: %.2f (%u samplers)", g_mipBias, g_samplersBiased.load());
     if (ImGui::TreeNode("Testing")) {

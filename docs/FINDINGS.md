@@ -28,3 +28,17 @@ Differences from Village: TAA registers shifted (t1 depth, t2 colour, t3 history
 a motion blur pass between TAA and bloom, the tonemap reads t0, and the final stretch is a
 compute pass writing a UAV. Next: bytecode of these passes (DumpShaders) to check the velocity and
 jitter conventions and how motion blur and tonemap compute screen positions.
+
+## Shaders (docs/shaders, DumpShaders bytecode, dxc -dumpbin)
+
+Same entry points as Village: PreTonemap2_PS (TAA, ps89b84994, + EffectMaskTex t0; velocity maths
+identical: prevUV = uv + (v.x*0.5, -v.y*0.5)), NewFinal (bloom, psdd975721),
+LDRPostProcess_WithTonemap (tonemap, ps0936c4dc: RE_POSTPROCESS_Color t0 loaded by pixel
+position, SceneInfo), CAS_CS (FidelityFX CAS stretch + sharpen, csa2614017), plus
+MotionBlur_ReconstructPS (ps1d41534e: NeighborMax and PreComputedV loaded by pixel position, so
+it can't be redrawn at output size) and LightShaftBilateralBlurYPS (pse9c57eca).
+
+0.1.0: VillageDLSS's design with RE2's ids and registers (TAA t1/t2/t4, tonemap t0). Upscaling:
+DLSS -> X, NewFinal redrawn into X, tonemap redrawn at output size into Y, CAS_CS skipped and Y
+drawn into its u0 (own RTV + blit). Motion blur and CAS sharpening aren't applied on the
+output-size path.
