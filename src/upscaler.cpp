@@ -91,7 +91,8 @@ struct Mode {
 };
 const Mode kModes[] = {{"Game's Image Quality slider", 0},  {"DLAA (100%)", 1.0f},
                        {"Quality (67%)", 0.667f},          {"Balanced (58%)", 0.58f},
-                       {"Performance (50%)", 0.5f},        {"Ultra Performance (33%)", 0.333f}};
+                       {"Performance (50%)", 0.5f}};
+// No Ultra Performance (33%): in RE2 its colours come out wrong (user, 2026-11-03).
 constexpr int kModeCount = sizeof(kModes) / sizeof(kModes[0]);
 
 void LoadSettings() {
