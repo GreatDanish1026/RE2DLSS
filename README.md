@@ -1,4 +1,4 @@
-# RE2DLSS 1.0.0
+# RE2DLSS 1.0.2
 
 ReShade add-on for **Resident Evil 2** (the 2019 remake, current DirectX 12 version) that replaces
 the game's TAA with **NVIDIA DLSS**. The game only has FSR 1 (a spatial upscaler); this gives it
@@ -24,14 +24,14 @@ mode dropdown.
 - **Sharper textures at lower render sizes** (on by default): a mip bias of log2(render scale) on
   the game's material textures, as NVIDIA recommends for DLSS. Set when the game starts, so after
   changing the DLSS mode, restart the game for the textures to follow.
-- **DLSS model**: K (transformer, default), J, or NVIDIA's default.
+- **DLSS model**: Automatic (default: K, M at Performance, L at Ultra Performance, as NVIDIA recommends), or K, J, L or M (DLSS 4.5) at every resolution, or NVIDIA's default.
 
 Settings are in ReShade's Add-ons tab (Home key) under RE2DLSS, saved in `ReShade.ini` under
 `[RE2DLSS]`.
 
 ## Install
 
-**With Fluffy Mod Manager**: put `RE2DLSS-1.0.0.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
+**With Fluffy Mod Manager**: put `RE2DLSS-1.0.2.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
 folder (or drag it onto the manager) and enable it. It installs into the game folder:
 
 - `RE2DLSS.addon64` (the add-on) and `nvngx_dlss.dll` (NVIDIA's DLSS runtime, 310.9.16)
