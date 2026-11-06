@@ -1,4 +1,5 @@
-// DLSS in place of the game's TAA (docs/FINDINGS.md).
+// DLSS or AMD FSR 3.1 / FSR 4 in place of the game's TAA, and frame generation (docs/FINDINGS.md,
+// docs/FRAMEGEN.md).
 //
 // Resident Evil 2, forked from VillageDLSS (the post chain is the same shaders; ids below).
 //
@@ -22,11 +23,21 @@
 //   4. Tonemap (LDRPostProcess_WithTonemap): reads t0 by pixel position and SceneInfo's screen
 //      size: the game's draw goes into Y at output size, t0 rewritten to X in its descriptor
 //      table, SceneInfo replaced by a copy with the output size.
-//   5. CAS_CS is skipped and Y is drawn into its output (our pass converts formats).
+//   5. CAS_CS is skipped and the final image is drawn into its output (our pass converts formats).
 // The HUD and the final output pass (and RenoDX) follow as usual.
 //
-// NGX records its own compute state and descriptor heaps on the game's command list, so the
-// game's bindings are tracked per command list and put back afterwards (as in ReunionDLSS).
+// FSR 3.1/4 (AMD's FidelityFX runtime) takes the same inputs into the same output (X), plus the
+// camera's near plane and field of view from SceneInfo.
+//
+// Frame generation (framegen.cpp) gets the TAA's depth and velocity and SceneInfo at the TAA draw,
+// whoever upscales, and the picture before the HUD: the HUD is drawn into the output-size texture
+// that the output pass writes to the back buffer. That texture is copied ("snapshot") once the
+// scene is in it (after the game's CAS_CS or our blit into it, else just before the first HUD draw);
+// after the output pass, the snapshot goes back into it and the output pass is repeated into a
+// target of ours (with all the game's and RenoDX's state): the screen without the HUD.
+//
+// NGX and FFX record their own compute state and descriptor heaps on the game's command list, so
+// the game's bindings are tracked per command list and put back afterwards (as in ReunionDLSS).
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -49,6 +60,7 @@
 #include "blit_ps.h"  // kBlitPs, kBlitVs: blit.hlsl compiled by build.ps1
 #include "blit_vs.h"
 #include "dlss.hpp"
+#include "fsr.hpp"
 #include "version.h"
 
 using namespace reshade::api;
@@ -60,11 +72,14 @@ namespace {
 constexpr uint32_t kTaaPs = 0x89b84994;      // PreTonemap2_PS: t1 depth, t2 colour, t3 history, t4 velocity
 constexpr uint32_t kTaaDepth = 1, kTaaColor = 2, kTaaMotion = 4;
 constexpr uint32_t kBloomPs = 0xdd975721;    // NewFinal
+constexpr bool kBloomIntoTaaOnly = false;     // (RE7's bloom shader also draws its smaller levels)
 constexpr uint32_t kTonemapPs = 0x0936c4dc;  // LDRPostProcess_WithTonemap (colour t0)
 constexpr uint32_t kTonemapColor = 0;
 constexpr uint32_t kCopyPs = 1;               // CopyImageWithDepthPS: not used in RE2
 constexpr uint32_t kSharpenPs = 2;            // Sharpness_PS: not used in RE2
+constexpr bool kSharpenOptional = true;
 constexpr uint32_t kFinalCs = 0xa2614017;    // CAS_CS: FidelityFX CAS, stretches (and sharpens) to output size, u0
+constexpr uint32_t kOutputPs = 0x6769b8ed;   // the HUD texture (t0) -> back buffer (RenoDX's HDR output)
 constexpr int kToggleHotkey = VK_F9;
 
 // SceneInfo (cb0 of the TAA and tonemap shaders), as float indices.
@@ -72,14 +87,18 @@ constexpr int kViewProj = 0;           // row_major float4x4, byte 0
 constexpr int kProjElement0 = 40;      // byte 160: x scale, y scale, jitter x, jitter y (clip space)
 constexpr int kPrevViewProj = 72;      // byte 288
 constexpr int kScreenSize = 92;        // byte 368: width, height, 1 / width, 1 / height
+constexpr int kNearPlane = 98;         // byte 392: cameraNearPlane
 constexpr int kSceneInfoFloats = 132;  // 528 bytes
 constexpr uint32_t kSceneInfoSlot = 768;  // 256-byte aligned
 constexpr uint32_t kSceneInfoSlots = 192;
 
 // ---------------------------------------------------------------- settings
 
+enum class Tech { Auto = 0, Dlss = 1, Fsr = 2 };
+
 struct Settings {
     bool enabled = true;   // F9; remembered across launches (on for a new install)
+    int upscaler = 0;      // Tech: Auto = DLSS where NGX runs (RTX), else FSR
     int preset = dlss::kPresetAuto;  // DLSS model: Automatic, or NVSDK_NGX_DLSS_Hint_Render_Preset_* (0 = NVIDIA's)
     bool flipJitterX = false, flipJitterY = false;  // testing: jitter sign
     bool upscale = true;   // below the output size: DLSS to output size (else DLAA at render size)
@@ -92,7 +111,7 @@ struct Mode {
     const char* name;
     float scale;
 };
-const Mode kModes[] = {{"Game's Image Quality slider", 0},  {"DLAA (100%)", 1.0f},
+const Mode kModes[] = {{"Game's Image Quality slider", 0},  {"Native (100%): DLAA / FSR native AA", 1.0f},
                        {"Quality (67%)", 0.667f},          {"Balanced (58%)", 0.58f},
                        {"Performance (50%)", 0.5f}};
 // No Ultra Performance (33%): in RE2 its colours come out wrong (user, 2026-11-03).
@@ -101,6 +120,7 @@ constexpr int kModeCount = sizeof(kModes) / sizeof(kModes[0]);
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_set.preset);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Upscaler", g_set.upscaler);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Upscale", g_set.upscale);
@@ -113,6 +133,7 @@ void LoadSettings() {
 void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssModel", g_set.preset);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Upscaler", g_set.upscaler);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Upscale", g_set.upscale);
@@ -123,14 +144,16 @@ void SaveSettings() {
 
 std::mutex g_statusMutex;
 std::string g_lastError;  // why the last TAA pass wasn't replaced
-std::string g_mode;       // "DLAA 3840x2160" / "upscaling 1920x1080 -> 3840x2160"
+std::string g_mode;       // "DLSS DLAA 3840x2160" / "FSR upscaling 1920x1080 -> 3840x2160"
+Tech g_active = Tech::Auto;  // the upscaler that ran last
+const char* TechName(int t) { return t == 1 ? "DLSS" : t == 2 ? "FSR 3.1 / FSR 4" : "Auto"; }
 uint64_t g_replaced = 0;
 
 std::string g_lastLogged;  // logged once per change, not every frame (a success in between doesn't count)
 
 void Fail(const std::string& why) {
     std::lock_guard<std::mutex> lock(g_statusMutex);
-    if (why != g_lastLogged) Log("DLSS: %s", why.c_str());
+    if (why != g_lastLogged) Log("Upscaler: %s", why.c_str());
     g_lastLogged = why;
     g_lastError = why;
 }
@@ -176,6 +199,14 @@ struct __declspec(uuid("8b3e5d71-2c4a-4f09-9e6d-1a7b3c5e9f20")) ListState {
     // state is put back before the next draw we don't handle, so nothing else is drawn with ours
     // (from RE3DLSS, where an unrecognised pass after a redirect drew a zoomed-in picture).
     bool redirected = false;
+    // The picture before the HUD: a snapshot of the HUD texture to take at the next event (after
+    // the pass that filled it), and the output pass to repeat after it is recorded.
+    resource snapTex = {0};
+    resource_usage snapState = resource_usage::undefined;
+    resource hudTex = {0};  // the HUD texture snapshotted on this list, and its state since
+    resource_usage hudState = resource_usage::undefined;
+    bool hudPending = false;
+    uint32_t hudVertices = 0, hudInstances = 0;
 };
 
 ListState* State(command_list* cl) { return cl->get_private_data<ListState>(); }
@@ -193,9 +224,12 @@ void OnResetList(command_list* cl) {
     if (ListState* s = State(cl)) *s = ListState();
 }
 
+void RunPending(command_list* cl, ListState& s, bool stateIntact);
+
 void OnBindPipeline(command_list* cl, pipeline_stage stages, pipeline pipe) {
     ListState* s = State(cl);
     if (!s) return;
+    RunPending(cl, *s, true);
     s->pipe = pipe;
     s->pipeStages = stages;
 }
@@ -238,6 +272,7 @@ void OnPushConstants(command_list* cl, shader_stage stages, pipeline_layout layo
 }
 
 void OnBindRenderTargets(command_list* cl, uint32_t count, const resource_view* rtvs, resource_view dsv) {
+    if (ListState* ls = State(cl)) RunPending(cl, *ls, true);
     ListState* s = State(cl);
     if (!s) return;
     s->rtvCount = count > 8 ? 8 : count;
@@ -383,6 +418,7 @@ bool CameraCut(const float* scene) {
 std::mutex g_resMutex;  // everything in this section
 device* g_dev = nullptr;
 uint64_t g_frame = 0;
+uint64_t g_lastRun = 0;  // g_frame + 1 when an upscaler last ran
 uint32_t g_outW = 0, g_outH = 0;  // the swap chain's size
 
 struct Texture {
@@ -475,6 +511,7 @@ struct UpscaleFrame {
     bool bloomDone = false, tonemapDone = false, sharpenDone = false;
     Texture* final = nullptr;  // what goes over the game's stretch
     uint64_t lastFrame = UINT64_MAX;  // last present count with upscaling
+    resource taaOut = {0};     // the game's TAA target (bloom's last upsample adds into it)
 } g_up;
 
 // Descriptor slots rewritten for the tonemap, put back when upscaling stops in case the game
@@ -515,6 +552,143 @@ void UnpatchAll(device* dev) {
     g_patches.clear();
 }
 
+// ---------------------------------------------------------------- render size, frame generation
+
+// The render size: the colour texture's, or SceneInfo's screen size when the viewport is smaller.
+void RenderSize(device* dev, resource color, const float* scene, uint32_t* w, uint32_t* h) {
+    const resource_desc cd = dev->get_resource_desc(color);
+    *w = cd.texture.width, *h = cd.texture.height;
+    const float sw = scene[kScreenSize], sh = scene[kScreenSize + 1];
+    if (sw >= 64 && sh >= 64 && sw <= *w && sh <= *h) *w = static_cast<uint32_t>(sw), *h = static_cast<uint32_t>(sh);
+}
+
+// The projection is shifted by the clip-space jitter; DLSS and FSR want the sample's offset from
+// the pixel centre in render pixels (x right, y down). Confirmed in game with DLAA (0.1.0).
+float JitterX(const float* scene, uint32_t w) { return -scene[kProjElement0 + 2] * w * 0.5f * (g_set.flipJitterX ? -1 : 1); }
+float JitterY(const float* scene, uint32_t h) { return scene[kProjElement0 + 3] * h * 0.5f * (g_set.flipJitterY ? -1 : 1); }
+
+// Frame generation's inputs, at the TAA draw (whoever upscales): the depth (depth read + shader
+// resource, 0xE0), the velocity (shader resource, 0xC0; NDC offsets, y up: UV = (0.5, -0.5) x),
+// SceneInfo, jitter, camera cut.
+void GiveFrameGen(command_list* cl, ListState& s) {
+    if (!FrameGenWantsCamera()) return;
+    device* dev = cl->get_device();
+    const resource depth = PixelSrv(dev, s.graphics, kTaaDepth);
+    const resource color = PixelSrv(dev, s.graphics, kTaaColor);
+    const resource motion = PixelSrv(dev, s.graphics, kTaaMotion);
+    float scene[kSceneInfoFloats];
+    if (!depth.handle || !color.handle || !motion.handle || !ReadSceneInfo(dev, s.graphics, scene)) return;
+    uint32_t w, h;
+    RenderSize(dev, color, scene, &w, &h);
+    FrameGenSetSceneInfo(scene);
+    constexpr unsigned kDepthRead = 0x20 | 0x40 | 0x80, kShaderResource = 0x40 | 0x80;  // D3D12 resource states
+    FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), reinterpret_cast<ID3D12Resource*>(depth.handle),
+                kDepthRead, reinterpret_cast<ID3D12Resource*>(motion.handle), kShaderResource, w, h, JitterX(scene, w),
+                JitterY(scene, h), 0.5f, -0.5f, CameraCut(scene));
+}
+
+// ---------------------------------------------------------------- the picture before the HUD
+
+Texture g_hudScene;                    // the snapshot (g_resMutex)
+resource g_hudSceneOf = {0};           // the HUD texture it was taken from
+uint64_t g_hudSceneFrame = UINT64_MAX;  // when
+uint64_t g_hudlessDrawn = 0;
+
+// Copies the HUD texture (in <state>) into the snapshot, before any HUD is drawn into it.
+void Snapshot(command_list* cl, ListState& s, resource tex, resource_usage state) {
+    if (!FrameGenWantsHudless() || !tex.handle || state == resource_usage::undefined) return;
+    device* dev = cl->get_device();
+    const resource_desc d = dev->get_resource_desc(tex);
+    std::lock_guard<std::mutex> lock(g_resMutex);
+    if (!Ensure(dev, g_hudScene, d.texture.width, d.texture.height, d.texture.format,
+                resource_usage::copy_source | resource_usage::copy_dest, resource_usage::copy_source, "picture before the HUD"))
+        return;
+    Transition(cl, g_hudScene, resource_usage::copy_dest);
+    cl->barrier(tex, state, resource_usage::copy_source);
+    cl->copy_resource(tex, g_hudScene.res);
+    cl->barrier(tex, resource_usage::copy_source, state);
+    Transition(cl, g_hudScene, resource_usage::copy_source);
+    g_hudSceneOf = tex, g_hudSceneFrame = g_frame;
+    s.hudTex = tex, s.hudState = state;
+}
+
+// After the output pass: the snapshot back into the HUD texture, the same draw into our target,
+// the game's render target back.
+void DrawHudless(command_list* cl, ListState& s) {
+    device* dev = cl->get_device();
+    resource tex = {0};
+    resource_view rtv = {0};
+    if (!s.rtvs[0].handle || s.hudState == resource_usage::undefined || !FrameGenHudlessTarget(dev, &tex, &rtv)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_resMutex);
+        if (!g_hudScene.res.handle || g_hudSceneOf != s.hudTex) return;
+        Transition(cl, g_hudScene, resource_usage::copy_source);
+        cl->barrier(s.hudTex, s.hudState, resource_usage::copy_dest);
+        cl->copy_resource(g_hudScene.res, s.hudTex);
+        cl->barrier(s.hudTex, resource_usage::copy_dest, s.hudState);
+    }
+    cl->barrier(tex, resource_usage::shader_resource, resource_usage::render_target);
+    cl->bind_render_targets_and_depth_stencil(1, &rtv);
+    cl->draw(s.hudVertices, s.hudInstances, 0, 0);
+    cl->bind_render_targets_and_depth_stencil(s.rtvCount, s.rtvs, s.dsv);
+    cl->barrier(tex, resource_usage::render_target, resource_usage::shader_resource);
+    FrameGenHudlessDrawn(cl);
+    if (++g_hudlessDrawn == 1) Log("frame generation: picture before the HUD drawn (output pass repeated without the HUD)");
+}
+
+// What's waiting on this list: a snapshot (any time before the HUD), and the repeated output pass
+// (only while the game's state is still the output pass's: <stateIntact>).
+void RunPending(command_list* cl, ListState& s, bool stateIntact) {
+    if (s.snapTex.handle) {
+        const resource tex = s.snapTex;
+        const resource_usage state = s.snapState;
+        s.snapTex = {0};
+        Snapshot(cl, s, tex, state);
+    }
+    if (s.hudPending) {
+        s.hudPending = false;
+        if (stateIntact) DrawHudless(cl, s);
+    }
+}
+
+// The HUD texture: what the output pass read last. When nothing took a snapshot of it yet this frame,
+// one is taken just before the first draw into it that isn't a full-screen triangle (the HUD): the
+// scene is in it then, whichever pass put it there (the stretch at render size, or the tonemap or
+// sharpening at native size).
+std::atomic<uint64_t> g_hudTexSeen{0};
+
+void SnapshotBeforeHud(command_list* cl, ListState& s) {
+    const uint64_t tex = g_hudTexSeen.load(std::memory_order_relaxed);
+    if (!tex || !FrameGenWantsHudless() || ViewResource(s.rtvs[0]).handle != tex) return;
+    {
+        std::lock_guard<std::mutex> lock(g_resMutex);
+        if (g_hudSceneFrame == g_frame && g_hudSceneOf.handle == tex) return;
+    }
+    Snapshot(cl, s, resource{tex}, resource_usage::render_target);
+}
+
+// The output pass is about to be recorded: repeat it afterwards if this frame has a snapshot of
+// the texture it reads.
+void NoteOutputPass(command_list* cl, ListState& s, uint32_t vertices, uint32_t instances) {
+    g_hudTexSeen = PixelSrv(cl->get_device(), s.graphics, 0).handle;
+    if (!s.hudTex.handle || !FrameGenWantsHudless()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_resMutex);
+        if (g_hudSceneFrame != g_frame || g_hudSceneOf != s.hudTex) return;
+    }
+    if (PixelSrv(cl->get_device(), s.graphics, 0) != s.hudTex) return;
+    s.hudPending = true;
+    s.hudVertices = vertices, s.hudInstances = instances;
+}
+
+void OnBarrier(command_list* cl, uint32_t count, const resource* res, const resource_usage*, const resource_usage* after) {
+    ListState* s = State(cl);
+    if (!s) return;
+    RunPending(cl, *s, true);
+    for (uint32_t i = 0; i < count; ++i)
+        if (res[i] == s->hudTex) s->hudState = after[i];
+}
+
 // ---------------------------------------------------------------- passes
 
 bool OnTaa(command_list* cl, ListState& s) {
@@ -532,18 +706,27 @@ bool OnTaa(command_list* cl, ListState& s) {
         Fail("camera constants (SceneInfo) not found");
         return false;
     }
-    const resource_desc cd = dev->get_resource_desc(color), td = dev->get_resource_desc(target);
-    uint32_t renderW = cd.texture.width, renderH = cd.texture.height;
-    const float sw = scene[kScreenSize], sh = scene[kScreenSize + 1];
-    if (sw >= 64 && sh >= 64 && sw <= renderW && sh <= renderH) {  // the viewport may be smaller than the texture
-        renderW = static_cast<uint32_t>(sw);
-        renderH = static_cast<uint32_t>(sh);
-    }
+    const resource_desc td = dev->get_resource_desc(target);
+    uint32_t renderW, renderH;
+    RenderSize(dev, color, scene, &renderW, &renderH);
 
+    // Which upscaler: Auto takes DLSS when NGX starts (RTX cards), FSR 3/4 otherwise.
+    ID3D12Device* d3d = reinterpret_cast<ID3D12Device*>(dev->get_native());
     std::string err;
-    if (!dlss::Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), err)) {
+    Tech tech = static_cast<Tech>(g_set.upscaler);
+    if (tech == Tech::Auto) {
+        std::string dlssErr;
+        tech = dlss::Init(d3d, dlssErr) ? Tech::Dlss : Tech::Fsr;
+    }
+    if (tech == Tech::Dlss ? !dlss::Init(d3d, err) : !fsr::Init(d3d, err)) {
         Fail(err);
         return false;
+    }
+    if (tech != g_active) {  // free the other upscaler's history textures
+        if (g_active == Tech::Dlss) dlss::ReleaseFeatures();
+        if (g_active == Tech::Fsr) fsr::ReleaseContexts();
+        Log("Upscaler: %s", tech == Tech::Dlss ? "DLSS" : "FSR 3/4");
+        g_active = tech;
     }
 
     std::lock_guard<std::mutex> lock(g_resMutex);
@@ -557,32 +740,56 @@ bool OnTaa(command_list* cl, ListState& s) {
         return false;
     }
 
-    dlss::Inputs in;
-    in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
-    in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
-    in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
-    in.output = reinterpret_cast<ID3D12Resource*>(g_x.res.handle);
-    in.renderWidth = renderW, in.renderHeight = renderH;
-    in.outputWidth = outW, in.outputHeight = outH;
-    // The projection is shifted by the clip-space jitter; DLSS wants the sample's offset from the
-    // pixel centre in render pixels (x right, y down). Confirmed in game with DLAA (0.1.0).
-    in.jitterX = -scene[kProjElement0 + 2] * renderW * 0.5f * (g_set.flipJitterX ? -1 : 1);
-    in.jitterY = scene[kProjElement0 + 3] * renderH * 0.5f * (g_set.flipJitterY ? -1 : 1);
-    in.motionScaleX = 0.5f * renderW;
-    in.motionScaleY = -0.5f * renderH;
-    in.reset = CameraCut(scene);
-    in.preset = g_set.preset;
-
+    const float jitterX = JitterX(scene, renderW), jitterY = JitterY(scene, renderH);
+    const bool reset = CameraCut(scene);
+    auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native());
     Transition(cl, g_x, resource_usage::unordered_access);
-    if (!dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err)) {
+    bool ok;
+    if (tech == Tech::Dlss) {
+        dlss::Inputs in;
+        in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
+        in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
+        in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+        in.output = reinterpret_cast<ID3D12Resource*>(g_x.res.handle);
+        in.renderWidth = renderW, in.renderHeight = renderH;
+        in.outputWidth = outW, in.outputHeight = outH;
+        in.jitterX = jitterX, in.jitterY = jitterY;
+        in.motionScaleX = 0.5f * renderW;  // NDC offsets, y up -> render pixels, y down
+        in.motionScaleY = -0.5f * renderH;
+        in.reset = reset;
+        in.preset = g_set.preset;
+        ok = dlss::Evaluate(list, in, err);
+    } else {
+        fsr::Inputs in;
+        in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
+        in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
+        in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+        in.output = reinterpret_cast<ID3D12Resource*>(g_x.res.handle);
+        in.renderWidth = renderW, in.renderHeight = renderH;
+        in.outputWidth = outW, in.outputHeight = outH;
+        in.jitterX = jitterX, in.jitterY = jitterY;
+        in.motionScaleX = 0.5f * renderW;
+        in.motionScaleY = -0.5f * renderH;
+        const float nearZ = scene[kNearPlane], yScale = scene[kProjElement0 + 1];
+        in.cameraNear = nearZ > 0 && nearZ < 10 ? nearZ : 0.01f;
+        in.cameraFar = 0;  // RE Engine: reversed Z, infinite far plane
+        in.cameraFovY = yScale > 0.05f ? 2 * std::atan(1 / yScale) : 1.0f;
+        in.metersPerUnit = 1.0f;  // RE Engine: metres
+        in.sharpness = 0;
+        in.reset = reset;
+        ok = fsr::Evaluate(list, in, err);
+    }
+    if (!ok) {
         Restore(cl, s);
         Fail(err);
         return false;
     }
 
-    std::string mode = upscale ? "upscaling " + std::to_string(renderW) + "x" + std::to_string(renderH) + " -> " +
-                                     std::to_string(outW) + "x" + std::to_string(outH)
-                               : "DLAA " + std::to_string(renderW) + "x" + std::to_string(renderH);
+    std::string mode = std::string(tech == Tech::Dlss ? "DLSS " : "FSR ") +
+                       (upscale ? std::to_string(renderW) + "x" + std::to_string(renderH) + " -> " + std::to_string(outW) +
+                                      "x" + std::to_string(outH)
+                                : (tech == Tech::Dlss ? "DLAA " : "native AA ") + std::to_string(renderW) + "x" +
+                                      std::to_string(renderH));
     bool replaced;
     if (upscale) {
         // The game's TAA still runs at render size (bloom input, history); the passes after it
@@ -592,6 +799,7 @@ bool OnTaa(command_list* cl, ListState& s) {
         g_up.bloomDone = g_up.tonemapDone = g_up.sharpenDone = false;
         g_up.final = nullptr;
         g_up.lastFrame = g_frame;
+        g_up.taaOut = target;
         replaced = false;
     } else {
         Transition(cl, g_x, resource_usage::copy_source);
@@ -606,9 +814,10 @@ bool OnTaa(command_list* cl, ListState& s) {
 
     std::lock_guard<std::mutex> slock(g_statusMutex);
     if (!g_replaced++ || !g_lastError.empty() || mode != g_mode)
-        Log("DLSS running: %s, jitter %.3f %.3f px%s", mode.c_str(), in.jitterX, in.jitterY, in.reset ? ", reset" : "");
+        Log("Upscaler running: %s, jitter %.3f %.3f px%s", mode.c_str(), jitterX, jitterY, reset ? ", reset" : "");
     g_mode = mode;
     g_lastError.clear();
+    g_lastRun = g_frame + 1;
     return replaced;
 }
 
@@ -619,10 +828,11 @@ bool OnTaa(command_list* cl, ListState& s) {
 // the output-size image, and its render-size target only feeds the stretch we replace. The game's
 // state is put back at that stretch (OnFinalCompute).
 
-// Bloom (additive, texture coordinates): the game's draw goes into X.
+// Bloom (additive, texture coordinates): the game's draw into its TAA output goes into X.
 void OnBloom(command_list* cl, ListState& s) {
     std::lock_guard<std::mutex> lock(g_resMutex);
     if (!g_up.active || g_up.bloomDone || !g_x.rtv.handle) return;
+    if (kBloomIntoTaaOnly && ViewResource(s.rtvs[0]) != g_up.taaOut) return;
     Transition(cl, g_x, resource_usage::render_target);
     BindFullTarget(cl, g_x.rtv, g_x.w, g_x.h);
     s.redirected = true;
@@ -693,15 +903,16 @@ bool OnTonemap(command_list* cl, ListState& s) {
     return false;  // the game's draw runs, at output size
 }
 
-// The game's sharpening (Sharpness_PS, reads t0, the game's Sharpness setting) at output size
-// into Z, from Y.
+// The game's sharpening (Sharpness_PS, reads t0, the game's Sharpness setting): the game's draw
+// redirected to output size, into Z from Y.
 bool OnSharpen(command_list* cl, ListState& s) {
     std::lock_guard<std::mutex> lock(g_resMutex);
-    if (!g_up.active || !g_up.tonemapDone || g_up.sharpenDone || !g_set.sharpen || !g_y.srv.handle) return false;
-    if (!RedrawAtOutputSize(cl, s, 0, g_y, g_z, "sharpened")) return false;
+    if (!g_up.active || !g_up.tonemapDone || g_up.sharpenDone || !g_y.srv.handle) return false;
+    if (kSharpenOptional && !g_set.sharpen) return false;
+    if (!RedrawAtOutputSize(cl, s, 0, g_y, g_z, "sharpened", true)) return false;
     g_up.sharpenDone = true;
     g_up.final = &g_z;
-    return true;
+    return false;  // the game's draw runs, at output size
 }
 
 // The game's stretch to output size: its draw runs (it also writes the output-size depth), then
@@ -789,7 +1000,7 @@ bool OnCopy(command_list* cl, ListState& s) {
     return true;
 }
 
-// RE2's stretch to output size is a compute pass (CAS_CS, u0 = the output-size target the HUD is
+// The stretch to output size is a compute pass (CAS_CS, u0 = the output-size target the HUD is
 // drawn into). When upscaling, it's skipped and the output-size image is drawn into that target
 // with our own pass (it converts formats), through a render target view of our own.
 
@@ -855,6 +1066,7 @@ bool OnFinalCompute(command_list* cl, ListState& s) {
     RestoreTargets(cl, s);
     s.redirected = false;  // everything is the game's again
     g_up.active = false;
+    s.snapTex = target, s.snapState = resource_usage::unordered_access;  // the scene before the HUD
     return true;
 }
 
@@ -863,7 +1075,8 @@ void DestroyAll(device* dev) {
         if (rtv.handle) dev->destroy_resource_view(rtv);
     g_targetRtvs.clear();
     dlss::Shutdown();
-    for (Texture* t : {&g_x, &g_y, &g_z}) Retire(*t);
+    fsr::Shutdown();
+    for (Texture* t : {&g_x, &g_y, &g_z, &g_hudScene}) Retire(*t);
     for (Old& o : g_old) {
         if (o.srv.handle) dev->destroy_resource_view(o.srv);
         if (o.rtv.handle) dev->destroy_resource_view(o.rtv);
@@ -901,7 +1114,7 @@ float g_mipBias = 0;
 std::atomic<uint32_t> g_samplersBiased{0}, g_samplersOther{0};
 
 float StartupRenderScale() {
-    FILE* f = _wfopen((ExeDir() + L"config.ini").c_str(), L"r");
+    FILE* f = _wfopen((ExeDir() + L"re2_config.ini").c_str(), L"r");
     if (!f) return 1;
     char line[256];
     float scale = 1;
@@ -976,10 +1189,14 @@ bool g_samplerStatsLogged = false;
 }  // namespace
 
 bool UpscalerOnDispatch(command_list* cl) {
-    if (!g_set.enabled) return false;
     ListState* s = State(cl);
-    if (!s || PipelinePs(s->pipe) != kFinalCs) return false;
-    return OnFinalCompute(cl, *s);
+    if (!s) return false;
+    RunPending(cl, *s, false);
+    if (PipelinePs(s->pipe) != kFinalCs) return false;
+    if (g_set.enabled && OnFinalCompute(cl, *s)) return true;
+    // The game's CAS runs: the HUD texture (u0) holds the scene after it.
+    s->snapTex = ComputeUav(cl->get_device(), s->compute, 0), s->snapState = resource_usage::unordered_access;
+    return false;
 }
 
 // Puts the game's own targets, viewport and bindings back after a redirected draw.
@@ -991,15 +1208,27 @@ void EndRedirect(command_list* cl, ListState& s) {
 }
 
 void UpscalerBeforeDraw(command_list* cl) {
-    if (ListState* s = State(cl)) EndRedirect(cl, *s);
+    if (ListState* s = State(cl)) {
+        RunPending(cl, *s, false);
+        EndRedirect(cl, *s);
+        SnapshotBeforeHud(cl, *s);
+    }
 }
 
 bool UpscalerOnDraw(command_list* cl, uint32_t vertices, uint32_t instances) {
     ListState* s = State(cl);
     if (!s) return false;
+    RunPending(cl, *s, false);
     EndRedirect(cl, *s);
-    if (!g_set.enabled || vertices != 3 || instances != 1) return false;
-    switch (PipelinePs(s->pipe)) {
+    if (vertices != 3 || instances != 1) {
+        SnapshotBeforeHud(cl, *s);
+        return false;
+    }
+    const uint32_t id = PipelinePs(s->pipe);
+    if (id == kTaaPs) GiveFrameGen(cl, *s);
+    if (id == kOutputPs) NoteOutputPass(cl, *s, vertices, instances);
+    if (!g_set.enabled) return false;
+    switch (id) {
         case kTaaPs: return OnTaa(cl, *s);
         case kBloomPs: OnBloom(cl, *s); return false;
         case kTonemapPs: return OnTonemap(cl, *s);
@@ -1011,6 +1240,11 @@ bool UpscalerOnDraw(command_list* cl, uint32_t vertices, uint32_t instances) {
 
 void UpscalerPresent(swapchain* sc) {
     dlss::EndFrame();
+    fsr::EndFrame();
+    if (g_frame % 600 == 599) {
+        const std::string d = FrameGenDiag();
+        if (!d.empty() && d.find("frames untagged 0,") == std::string::npos) Log("frame generation diag:%s", d.c_str());
+    }
     {
         std::lock_guard<std::mutex> lock(g_resMutex);
         ++g_frame;
@@ -1037,7 +1271,7 @@ void UpscalerPresent(swapchain* sc) {
     if (down && !g_keyWasDown) {
         g_set.enabled = !g_set.enabled;
         SaveSettings();
-        Log("DLSS %s (F9)", g_set.enabled ? "on" : "off");
+        Log("Upscaling %s (F9)", g_set.enabled ? "on" : "off");
     }
     g_keyWasDown = down;
     g_wasEnabled = g_set.enabled;
@@ -1047,6 +1281,22 @@ void UpscalerPresent(swapchain* sc) {
         Log("samplers: %u material ones biased by %.2f, %u others", g_samplersBiased.load(), g_mipBias, g_samplersOther.load());
     }
 }
+
+const ImVec4 kWarn(1, 0.6f, 0.3f, 1);
+
+float ControlWidth() { return ImGui::GetFontSize() * 14.0f; }
+
+void Help(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+void RestoreListState(command_list* cl) {
+    if (ListState* s = State(cl)) Restore(cl, *s);
+}
+
+namespace {
 
 // DLSS models offered (NVSDK_NGX_DLSS_Hint_Render_Preset_*; dlss::kPresetAuto = per render scale).
 const char* const kModelNames[] = {"Automatic (recommended)", "K (transformer)", "J (transformer)",
@@ -1059,50 +1309,138 @@ int ModelIndex(int id) {
     return 0;
 }
 
-void UpscalerOverlay() {
-    bool changed = ImGui::Checkbox("DLSS in place of TAA (F9)", &g_set.enabled);
-    changed |= ImGui::Checkbox("Upscale when Image Quality is below 1.0", &g_set.upscale);
-    {
-        const char* names[kModeCount];
-        for (int i = 0; i < kModeCount; ++i) names[i] = kModes[i].name;
-        changed |= ImGui::Combo("DLSS mode", &g_set.mode, names, kModeCount);
-        float now = 0;
-        if (ScriptStatus(&now))
-            ImGui::TextDisabled("Render scale now: %.0f%%%s", now * 100, g_set.mode > 0 && g_set.enabled ? " (set by the DLSS mode)" : " (game's slider)");
-        else if (g_set.mode > 0)
-            ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "RE2DLSS.lua isn't running: copy it to reframework\\autorun");
-    }
-    int model = ModelIndex(g_set.preset);
-    if (ImGui::Combo("DLSS model", &model, kModelNames, kModelCount)) {
-        g_set.preset = kModelIds[model];
-        changed = true;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", "Which DLSS model upscales. Automatic follows NVIDIA's recommendation for the "
-                          "render resolution: K from 100% down to Balanced, M at Performance (50%), L at "
-                          "Ultra Performance (33%). K, J, L or M use that model at every resolution; L "
-                          "and M (DLSS 4.5's second-generation transformer) cost more, especially on RTX "
-                          "20 and 30 cards. NVIDIA's default leaves it to the driver. A DLSS override set "
-                          "in the NVIDIA App takes precedence.");
-    if (kSharpenPs > 2) changed |= ImGui::Checkbox("Game sharpening at output size", &g_set.sharpen);
-    changed |= ImGui::Checkbox("Sharper textures at lower render sizes (needs a restart)", &g_set.textureDetail);
-    ImGui::TextDisabled("Texture mip bias now: %.2f (%u samplers)", g_mipBias, g_samplersBiased.load());
-    if (ImGui::TreeNode("Testing")) {
-        changed |= ImGui::Checkbox("Flip jitter X", &g_set.flipJitterX);
-        ImGui::SameLine();
-        changed |= ImGui::Checkbox("Flip jitter Y", &g_set.flipJitterY);
-        ImGui::TreePop();
-    }
-    if (changed) SaveSettings();
+// The upscaler that runs with the current settings (Auto resolves once DLSS was tried).
+Tech ResolvedTech() {
+    if (g_set.upscaler == static_cast<int>(Tech::Dlss)) return Tech::Dlss;
+    if (g_set.upscaler == static_cast<int>(Tech::Fsr)) return Tech::Fsr;
+    return g_active != Tech::Auto ? g_active : Tech::Dlss;
+}
+
+// One line for the top of the overlay: what replaces the TAA right now; *warn when it's a problem.
+std::string UpscalerHeadline(bool* warn) {
+    *warn = false;
     std::string err, mode;
     {
         std::lock_guard<std::mutex> lock(g_statusMutex);
         err = g_lastError;
         mode = g_mode;
     }
-    ImGui::TextDisabled("DLSS: %s", dlss::Status().c_str());
-    if (g_set.enabled && !mode.empty()) ImGui::TextDisabled("Mode: %s", mode.c_str());
-    if (g_set.enabled && !err.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "%s", err.c_str());
+    if (!g_set.enabled) return "Upscaling off (F9): the game's TAA";
+    uint64_t frame, lastRun;
+    {
+        std::lock_guard<std::mutex> lock(g_resMutex);
+        frame = g_frame, lastRun = g_lastRun;
+    }
+    if (lastRun && frame < lastRun + 30) return "Upscaling: " + mode;
+    *warn = true;
+    if (!err.empty()) return "Upscaling not running: " + err;
+    return "Upscaling waits for the game's TAA: keep Anti-Aliasing on TAA (menus don't use it)";
+}
+
+}  // namespace
+
+void UpscalerOverlay() {
+    ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION);
+    bool warn = false;
+    const std::string up = UpscalerHeadline(&warn);
+    if (warn) ImGui::TextColored(kWarn, "%s", up.c_str());
+    else ImGui::TextUnformatted(up.c_str());
+    const std::string fg = FrameGenHeadline(&warn);
+    if (warn) ImGui::TextColored(kWarn, "%s", fg.c_str());
+    else ImGui::TextUnformatted(fg.c_str());
+    ImGui::Spacing();
+
+    if (!ImGui::BeginTabBar("##re2dlss")) return;
+    bool changed = false;
+    if (ImGui::BeginTabItem("Settings")) {
+        ImGui::SeparatorText("Upscaling");
+        changed |= ImGui::Checkbox("Upscaling (F9)", &g_set.enabled);
+        Help("Puts DLSS or FSR 3/4 in place of the game's TAA: at 100% render resolution DLAA (or FSR's native "
+             "anti-aliasing), below it upscaling to the screen, with the game's bloom, tonemapping (RenoDX's HDR) and HUD at "
+             "full resolution. Keep the game's Anti-Aliasing on TAA.\n\nF9 switches it on and off.");
+        ImGui::BeginDisabled(!g_set.enabled);
+        const char* techs[] = {"Auto", "DLSS", "FSR 3.1 / FSR 4"};
+        if (g_set.upscaler < 0 || g_set.upscaler > 2) g_set.upscaler = 0;
+        ImGui::SetNextItemWidth(ControlWidth());
+        if (ImGui::Combo("Upscaler", &g_set.upscaler, techs, 3)) {
+            changed = true;
+            Log("Upscaler setting: %s", TechName(g_set.upscaler));
+        }
+        Help("Auto: DLSS on NVIDIA RTX cards, FSR on others.\nDLSS: NVIDIA DLSS Super Resolution (RTX cards).\n"
+             "FSR 3.1 / FSR 4: AMD's upscaler, any DirectX 12 card; AMD's runtime picks FSR 4 on Radeon cards that "
+             "support it.\n\nSwitches right away.");
+        const char* names[kModeCount];
+        for (int i = 0; i < kModeCount; ++i) names[i] = kModes[i].name;
+        ImGui::SetNextItemWidth(ControlWidth());
+        changed |= ImGui::Combo("Render resolution", &g_set.mode, names, kModeCount);
+        Help("Sets the game's render scale (its Image Quality setting) while upscaling is on, and keeps it there. "
+             "Needs REFramework (the bundled RE2DLSS.lua sets it). \"Game's Image Quality slider\" leaves it to the "
+             "game's menu.");
+        float now = 0;
+        if (ScriptStatus(&now))
+            ImGui::TextDisabled("Render scale now: %.0f%%%s", now * 100,
+                                g_set.mode > 0 && g_set.enabled ? "" : " (the game's slider)");
+        else if (g_set.mode > 0)
+            ImGui::TextColored(kWarn, "RE2DLSS.lua isn't running: is REFramework installed?");
+        {
+            ImGui::BeginDisabled(ResolvedTech() == Tech::Fsr);
+            int model = ModelIndex(g_set.preset);
+            ImGui::SetNextItemWidth(ControlWidth());
+            if (ImGui::Combo("DLSS model", &model, kModelNames, kModelCount)) {
+                g_set.preset = kModelIds[model];
+                changed = true;
+                Log("DLSS model setting: %s", kModelNames[model]);
+            }
+            ImGui::EndDisabled();
+            Help("Which DLSS model upscales. Automatic follows NVIDIA's recommendation for the render "
+                 "resolution: K from 100% down to Balanced, M at Performance (50%), L at Ultra "
+                 "Performance (33%). K, J, L or M use that model at every resolution; L and M (DLSS 4.5's "
+                 "second-generation transformer) cost more, especially on RTX 20 and 30 cards. NVIDIA's "
+                 "default leaves it to the driver. A DLSS override set in the NVIDIA App takes "
+                 "precedence.\n\nOnly used when DLSS upscales (greyed out while FSR does).");
+        }
+        ImGui::EndDisabled();
+        DrawFrameGenSettings();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Status")) {
+        ImGui::SeparatorText("Upscaling");
+        ImGui::TextDisabled("DLSS: %s", dlss::Status().c_str());
+        ImGui::TextDisabled("FSR: %s", fsr::Status().c_str());
+        ImGui::TextDisabled("Texture mip bias: %.2f (%u samplers)", g_mipBias, g_samplersBiased.load());
+        std::string err;
+        {
+            std::lock_guard<std::mutex> lock(g_statusMutex);
+            err = g_lastError;
+        }
+        if (g_set.enabled && !err.empty()) ImGui::TextColored(kWarn, "Last problem: %s", err.c_str());
+        DrawFrameGenStatus();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Advanced")) {
+        ImGui::SeparatorText("Upscaling");
+        changed |= ImGui::Checkbox("Upscale below 100% render resolution", &g_set.upscale);
+        Help("On: below 100%, DLSS/FSR upscale to the screen and the game's post-processing runs at full "
+             "resolution. Off: DLSS/FSR anti-alias at the render size and the game stretches the picture.");
+        if (kSharpenPs > 2 && kSharpenOptional) {
+            changed |= ImGui::Checkbox("Game sharpening when upscaling", &g_set.sharpen);
+            Help("Below 100%, the game's sharpening (its Sharpness setting) runs on the upscaled image. Off: "
+                 "only DLSS/FSR's own result.");
+        }
+        changed |= ImGui::Checkbox("Sharper textures at lower render resolutions", &g_set.textureDetail);
+        Help("A mip bias of log2(render scale) on the game's material textures, as NVIDIA recommends. Set when "
+             "the game starts: restart after changing the render resolution.");
+        changed |= ImGui::Checkbox("Flip jitter X", &g_set.flipJitterX);
+        ImGui::SameLine();
+        changed |= ImGui::Checkbox("Flip jitter Y", &g_set.flipJitterY);
+        Help("Testing only: the sign of the camera jitter given to DLSS and FSR. Leave both off.");
+        DrawFrameGenAdvanced();
+        ImGui::SeparatorText("Development");
+        DrawCaptureTool();
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+    if (changed) SaveSettings();
 }
 
 void UpscalerInit() {
@@ -1119,10 +1457,13 @@ void UpscalerInit() {
     reshade::register_event<reshade::addon_event::bind_scissor_rects>(&OnBindScissors);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::register_event<reshade::addon_event::create_sampler>(&OnCreateSampler);
+    reshade::register_event<reshade::addon_event::barrier>(&OnBarrier);
+    RegisterFrameGen();
     const float scale = g_set.enabled && g_set.mode > 0 ? kModes[g_set.mode].scale : StartupRenderScale();
     if (g_set.enabled && g_set.upscale && g_set.textureDetail && scale < 0.99f) g_mipBias = std::log2(scale);
     Log("texture mip bias %.2f (Image Quality %.2f at start)", g_mipBias, scale);
-    Log("DLSS %s at start (F9 toggles), upscaling %s", g_set.enabled ? "on" : "off", g_set.upscale ? "on" : "off");
+    Log("Upscaling %s at start (F9 toggles), upscaler setting %d (0 auto, 1 DLSS, 2 FSR), upscaling below 100%% %s",
+        g_set.enabled ? "on" : "off", g_set.upscaler, g_set.upscale ? "on" : "off");
 }
 
 void UpscalerShutdown() {
@@ -1138,6 +1479,8 @@ void UpscalerShutdown() {
     reshade::unregister_event<reshade::addon_event::bind_scissor_rects>(&OnBindScissors);
     reshade::unregister_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::unregister_event<reshade::addon_event::create_sampler>(&OnCreateSampler);
+    reshade::unregister_event<reshade::addon_event::barrier>(&OnBarrier);
+    UnregisterFrameGen();
 }
 
 }  // namespace rd

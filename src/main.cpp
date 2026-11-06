@@ -2,7 +2,7 @@
 // the game's TAA with DLSS (upscaler.cpp). This file: logging, shader ids, resource tracking,
 // the overlay, and the frame capture tool used to find TAA (docs/FINDINGS.md).
 //
-// Frame capture: F10 records two frames of GPU work to RE2DLSS-frame-N.txt next to re8.exe:
+// Frame capture: F10 records two frames of GPU work to RE2DLSS-frame-N.txt next to re2.exe:
 //   - every compute dispatch, and every full-screen draw (3 or 4 vertices / 6 indices, one
 //     instance), with a stable id of its shader, the viewport, render targets, root constants,
 //     root constant buffers and the textures in its descriptor tables by shader register;
@@ -935,22 +935,7 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
 
 // ---------------------------------------------------------------- overlay
 
-void DrawOverlay(effect_runtime*) {
-    ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION);
-    rd::UpscalerOverlay();
-    if (!ImGui::TreeNode("Development: frame capture")) return;
-    ImGui::TextDisabled("Writes two frames of GPU work to RE2DLSS-frame-N.txt (for finding passes).");
-    ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
-    if (ImGui::Button(g_captureHotkey ? "Capture frame (F10)" : "Capture frame")) StartCapture();
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
-    {
-        std::lock_guard<std::mutex> lock(g_pipeMutex);
-        ImGui::TextDisabled("%zu compute and %zu graphics pipelines known", g_computePipes, g_graphicsPipes);
-    }
-    ImGui::TreePop();
-}
+void DrawOverlay(effect_runtime*) { rd::UpscalerOverlay(); }
 
 }  // namespace
 
@@ -964,6 +949,18 @@ void Log(const char* fmt, ...) {
 }
 
 std::wstring ExeDir() { return g_exeDir; }
+
+void DrawCaptureTool() {
+    ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
+    if (ImGui::Button(g_captureHotkey ? "Capture frame (F10)" : "Capture frame")) StartCapture();
+    ImGui::EndDisabled();
+    Help("Writes two frames of the game's GPU work to RE2DLSS-frame-N.txt next to re2.exe, for finding the "
+         "game's passes after a game update.");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
+    std::lock_guard<std::mutex> lock(g_pipeMutex);
+    ImGui::TextDisabled("%zu compute and %zu graphics pipelines known", g_computePipes, g_graphicsPipes);
+}
 
 uint32_t PipelinePs(pipeline pipe) {
     const PipeIds ids = Pipe(pipe);
