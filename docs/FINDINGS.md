@@ -52,3 +52,36 @@ redirects the game's own NewFinal and tonemap draws to output size (target, view
 SceneInfo) and lets them run; the state is put back at CAS_CS. User: looks right. Log: every
 DLSS mode via the dropdown (RE2DLSS.lua works in RE2): 2561x1440, 2227x1252, 1920x1080,
 1278x719 -> 3840x2160 and DLAA 3840x2160, no fallbacks.
+
+## Ray tracing chain (for DLSS Ray Reconstruction; 2026-11-09)
+
+Shader dump with ray-traced reflections on (PCRaytracingReflection=2): bytecode and `dxc -dumpbin`
+in `docs/shaders/rt` (DXIL keeps RE Engine's entry and resource names). Ray tracing is inline ray
+queries in compute shaders (no DispatchRays) at **half resolution** (1920x1080 at 4K, 100%).
+
+| Step | Shader | Name | Reads -> writes |
+|---|---|---|---|
+| rays | cs940560df (32400 groups) / cs88078fd1 (8160) | rayTracingRayDirection | specular / diffuse rays |
+| trace | cseb3ce396 / csed7839f5 | EntryPoint (RayQuery) | payloads |
+| VFX | cs5dab1903 / csddef9834 | EntryPoint | vfxDiffuse / vfxSpecular (f32) |
+| shade diffuse | csfc23ed5b | rayTracingShading | -> **shY (u32) + cocg (f32)**: GI as spherical-harmonics luma + chroma |
+| shade specular | cs2f1da6b8 | rayTracingShading | -> **specular (u32)**, rayDir |
+| history setup | cs5cbce99d, cs1984f87a, csd2e88065 | CalcMotionNormalDepth, CalcHistory, DownsamplingBuffer | velocity, history counts/weights |
+| denoise spec | cs25501ade -> cs0af21e0f -> csa4fd0f93 -> cs091f2a20 | SpatialAccumulation, MeanVariance, TemporalAccumulation, DeflickerSpecular | specular -> filterSpecular |
+| denoise diffuse | csd6792963 -> cs94984fd1 | SpatialAccumulation, TemporalAccumulation | shY/cocg -> filterShY/CoCg |
+| denoise VFX | cs6b883e38 -> cs04bec84e -> csc67ec41e | VFXMedianFilter, SpatialAccumulationVFX, TemporalFilterVFX | vfxSpecular |
+| final filter | cs905f94bf | BilateralFilter | history ShY/CoCg/Specular -> filter* |
+| **upscale + apply** | **cse120127f** (8x8 groups at full res) | **rayTracingUpscale** | t0 depth, t2 **BaseColorMetallic**, t3 **NormalXNormalYRoughnessMisc**, t4 PreGF, t5 historyShY, t6 historyCoCg, t7 historySpecular, t8 specularVFX -> **u0 Result** (read-modify-write: adds RT lighting onto the scene colour at full res) |
+
+Each signal keeps its format through the chain, so the denoise passes can be skipped and the raw
+(or spatial-only) signal handed to the upscale pass. The diffuse rays are a quarter of the specular
+ones (8160 vs 32400 groups; "Sudoku" scrambled pattern), so the raw diffuse is sparse and the
+spatial accumulation probably has to stay to fill it.
+
+G-buffer (from the upscale's decode): NormalXNormalYRoughnessMisc rgb10a2 = octahedral normal in
+xy (x*2-1, y*2-1, z = 1-|x|-|y|, folded when z < 0), roughness z (>= 0.01), misc w (metallic in
+BaseColorMetallic.a only counts when w > 0.667). BaseColorMetallic rgba8 sRGB = base colour +
+metallic. SceneInfo (cb0) layout as Village: viewProjMat 0, transposeViewMat (3x4) 64,
+transposeViewInvMat 112, projElement[2] 160, projInvElements 192, viewProjInvMat 224,
+prevViewProjMat 288, screenSize 368, near 392, far 396. RayTracingDenoiserConstantBufferInfo has
+ResolutionRatio, ResDiffuse/ResSpecular (RT resolution).

@@ -1,0 +1,2 @@
+dxc failed : DXIL container is missing DXIL part.
+
