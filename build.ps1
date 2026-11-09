@@ -34,6 +34,8 @@ $cmd = @(
     "fxc /nologo /T ps_5_0 /E PsMain /O3 /Vn kBlitPs /Fh `"$obj\blit_ps.h`" `"$root\src\blit.hlsl`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kUiAlphaCs /Fh `"$obj\ui_alpha_cs.h`" `"$root\src\ui_alpha.hlsl`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kHudComposeCs /Fh `"$obj\hud_compose_cs.h`" `"$root\src\hud_compose.hlsl`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kGuideCs /Fh `"$obj\guide_cs.h`" `"$root\src\guide.hlsl`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kGuideViewCs /Fh `"$obj\guide_view_cs.h`" `"$root\src\guide_view.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
      "/I `"$obj`" /I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" " +
      "/I `"$root\third_party\streamline\include`" " +
@@ -49,6 +51,8 @@ Write-Host "Built $addon"
 
 # NVIDIA's signed DLSS runtime (310.9.16, from the Streamline 2.14.16 SDK's bin\x64; not in git).
 $ngx = "$root\third_party\bin\nvngx_dlss.dll"
+# DLSS Ray Reconstruction 310.9.16 (same source).
+$ngxd = "$root\third_party\bin\nvngx_dlssd.dll"
 # NVIDIA's Streamline runtime (frame generation), signed, in a streamline folder next to the exe.
 $sl = "$root\third_party\streamline\bin\x64"
 $slFiles = "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll"
@@ -57,19 +61,20 @@ $ffx = "$root\third_party\fidelityfx\bin"
 $ffxFiles = "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll"
 if ($Install -or $Package) {
     if (-not (Test-Path $ngx)) { throw "nvngx_dlss.dll not found in third_party\bin" }
+    if (-not (Test-Path $ngxd)) { throw "nvngx_dlssd.dll not found in third_party\bin" }
     foreach ($f in $slFiles) { if (-not (Test-Path "$sl\$f")) { throw "$f not found in $sl (unzip NVIDIA's Streamline 2.14.16 release there)" } }
     foreach ($f in $ffxFiles) { if (-not (Test-Path "$ffx\$f")) { throw "$f not found in $ffx (copy Kits\FidelityFX\signedbin from AMD's FSR SDK 2.4.0)" } }
 }
 
 # The add-on and the NVIDIA and AMD runtimes, as they go in the game folder.
 function Copy-Runtime([string]$dest) {
-    Copy-Item $addon, $ngx $dest -Force
+    Copy-Item $addon, $ngx, $ngxd $dest -Force
     foreach ($f in $ffxFiles) { Copy-Item "$ffx\$f" $dest -Force }
     New-Item -ItemType Directory -Force "$dest\streamline" | Out-Null
     foreach ($f in $slFiles) { Copy-Item "$sl\$f" "$dest\streamline" -Force }
     # Streamline starts NGX first, with the streamline folder as where DLSS lives: DLSS upscaling
     # then looks there too.
-    Copy-Item $ngx "$dest\streamline" -Force
+    Copy-Item $ngx, $ngxd "$dest\streamline" -Force
 }
 
 if ($Install) {
