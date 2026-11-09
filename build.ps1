@@ -112,7 +112,7 @@ if ($Package) {
     @(
         "name=RE2DLSS - DLSS, FSR 3/4 and frame generation for Resident Evil 2",
         "version=v$version",
-        "description=Replaces the game's TAA with NVIDIA DLSS or AMD FSR 3.1 / FSR 4: native anti-aliasing (DLAA), or upscaling with the game's bloom, tonemapping (RenoDX HDR works) and HUD on top at full resolution; adds DLSS or FSR frame generation. DLSS needs an NVIDIA RTX card (frame generation RTX 40/50); FSR runs on any DirectX 12 GPU. Needs ReShade 6.8+ with add-on support, and REFramework for the render resolution dropdown. Settings: ReShade overlay (Home), Add-ons tab, RE2DLSS; F9 switches upscaling on and off.",
+        "description=Replaces the game's TAA with NVIDIA DLSS or AMD FSR 3.1 / FSR 4: native anti-aliasing (DLAA), or upscaling with the game's bloom, tonemapping (RenoDX HDR works) and HUD on top at full resolution; adds DLSS or FSR frame generation, and experimental DLSS Ray Reconstruction for the ray-traced reflections and lighting. DLSS needs an NVIDIA RTX card (frame generation RTX 40/50); FSR runs on any DirectX 12 GPU. Needs ReShade 6.8+ with add-on support, and REFramework for the render resolution dropdown. Settings: ReShade overlay (Home), Add-ons tab, RE2DLSS; F9 switches upscaling on and off.",
         "author=Scott Dinwiddie"
     ) | Set-Content "$mod\modinfo.ini" -Encoding ascii
 

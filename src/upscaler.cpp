@@ -116,7 +116,7 @@ struct Settings {
     // guideView: debug view of one guide (not saved).
     bool rr = false;
     int rrPreset = 0;
-    int rrDenoise = 1;
+    int rrDenoise = 0;
     int guideView = 0;
 } g_set;
 
@@ -145,7 +145,7 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "RrModel", g_set.rrPreset);
     if (g_set.rrPreset != 0 && (g_set.rrPreset < 4 || g_set.rrPreset > 6)) g_set.rrPreset = 0;
     reshade::get_config_value(nullptr, RD_PRODUCT, "RrDenoise", g_set.rrDenoise);
-    if (g_set.rrDenoise < 0 || g_set.rrDenoise > 2) g_set.rrDenoise = 1;
+    if (g_set.rrDenoise < 0 || g_set.rrDenoise > 2) g_set.rrDenoise = 0;
 }
 
 void SaveSettings() {
@@ -601,8 +601,8 @@ constexpr uint32_t kRtTemporalVfx = 0xc67ec41e;       // rayTracingTemporalFilte
 constexpr uint32_t kRtUpscale = 0xe120127f;           // rayTracingUpscale: t2 base colour, t3 normal, t5-t8 signals
 constexpr uint32_t kUpBase = 2, kUpNormal = 3, kUpSignal = 5;  // t5 shY, t6 cocg, t7 specular, t8 VFX specular
 
-const char* const kRrDenoiseNames[] = {"Game's denoiser (Ray Reconstruction on top)",
-                                       "Skip all but the spatial passes (recommended)", "Skip all (raw rays)"};
+const char* const kRrDenoiseNames[] = {"Game's denoiser, Ray Reconstruction on top (recommended)",
+                                       "Skip all but the spatial passes (experimental)", "Skip all: raw rays (experimental)"};
 const char* const kGuideViewNames[] = {"Off", "Diffuse albedo", "Specular albedo", "Normals", "Roughness"};
 constexpr int kGuideViewCount = 5;
 
@@ -1927,11 +1927,11 @@ void UpscalerOverlay() {
                 changed = true;
                 Log("Ray Reconstruction setting: %s", g_set.rr ? "on" : "off");
             }
-            Help("NVIDIA's DLSS Ray Reconstruction: one AI model cleans up the ray-traced reflections and lighting AND\n"
-                 "upscales, in place of the game's ray tracing denoiser and DLSS Super Resolution. Needs the game's\n"
-                 "ray tracing on. Experimental: the game traces at half resolution, which Ray Reconstruction isn't\n"
-                 "made for; compare it with the game's denoiser (F9 switches all upscaling off and on, the\n"
-                 "Advanced tab has the denoising choice).");
+            Help("NVIDIA's DLSS Ray Reconstruction in place of DLSS Super Resolution while the game ray traces:\n"
+                 "it upscales and cleans up what's left of the noise in the ray-traced reflections and lighting,\n"
+                 "on top of the game's own ray tracing denoiser. Needs the game's ray tracing on (Super Resolution\n"
+                 "otherwise). Experimental. The Advanced tab can skip parts of the game's denoiser for testing; the\n"
+                 "game traces at half resolution, which Ray Reconstruction isn't made for, so that looked worse.");
             if (g_set.rr) {
                 static const char* const kRrNames[] = {"NVIDIA's default", "D (transformer)", "E (latest transformer)",
                                                        "F (RR 2)"};
@@ -2003,10 +2003,12 @@ void UpscalerOverlay() {
             Log("Ray Reconstruction denoising setting: %s", kRrDenoiseNames[g_set.rrDenoise]);
         }
         Help("While Ray Reconstruction runs, which of the game's own ray tracing denoise passes still run.\n"
-             "Skip all but the spatial passes: the game's frame-to-frame (temporal) filtering, variance and\n"
-             "deflicker are skipped; its spatial passes still fill in the sparse rays (the game traces global\n"
-             "illumination with a quarter of the rays). Skip all: Ray Reconstruction gets the raw rays.\n"
-             "Game's denoiser: everything stays, Ray Reconstruction only upscales the result.");
+             "Game's denoiser (recommended, looked best in testing): everything stays; Ray Reconstruction\n"
+             "upscales and cleans up the result. Skip all but the spatial passes: the game's frame-to-frame\n"
+             "(temporal) filtering, variance and deflicker are skipped; its spatial passes still fill in the\n"
+             "sparse rays (global illumination is traced with a quarter of the rays). Skip all: Ray\n"
+             "Reconstruction gets the raw rays. The game traces at half resolution, so the skipping choices\n"
+             "come out blotchier.");
         ImGui::SetNextItemWidth(ControlWidth());
         if (ImGui::Combo("Show guide", &g_set.guideView, kGuideViewNames, kGuideViewCount))
             Log("diagnosis: show guide %s", kGuideViewNames[g_set.guideView]);

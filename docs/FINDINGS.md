@@ -85,3 +85,22 @@ metallic. SceneInfo (cb0) layout as Village: viewProjMat 0, transposeViewMat (3x
 transposeViewInvMat 112, projElement[2] 160, projInvElements 192, viewProjInvMat 224,
 prevViewProjMat 288, screenSize 368, near 392, far 396. RayTracingDenoiserConstantBufferInfo has
 ResolutionRatio, ResDiffuse/ResSpecular (RT resolution).
+
+## 1.2.0: DLSS Ray Reconstruction (2026-11-09)
+
+Design in `src/upscaler.cpp` ("Ray Reconstruction"): at rayTracingUpscale the G-buffer (t2 base
+colour fmt 29 rgba8 sRGB, t3 normal fmt 24 rgb10a2, at render size) is noted; at the TAA,
+`src/guide.hlsl` makes the guides (decoding as the game's shader: octahedral normal, roughness z,
+metallic only when misc > 0.667, F0 = max(0.04, base * metallic), N.V from viewProjInvMat and
+the camera position in transposeViewInvMat's .w column) and DLSS-D replaces DLSS. Camera:
+world-to-view from SceneInfo.transposeViewMat (read as columns; the reading that gives a
+projection-shaped view-to-clip is kept), view-to-clip = inverse(world-to-view) * viewProjMat.
+RrDenoise 1/2 skip the game's denoise passes (all but spatial / all) and copy the signals into
+rayTracingUpscale's t5-t8 in their barrier-tracked states.
+
+Test (2026-11-09, 4K HDR, Quality 2561x1440, RT reflections on, RTX 5080): RR on every
+ray-traced frame, 4 of 4 signals handed over in the skip modes, models D/E/F, cutscene letterbox
+(2561x1398 -> 3840x2097) handled, no errors. User: RR looks **better than Super Resolution**, and
+of the denoise choices **the game's denoiser with RR on top looked best**: the half-resolution
+signal without the game's temporal filtering comes out blotchier. So RrDenoise defaults to 0; the
+skip modes stay in Advanced as experiments.
