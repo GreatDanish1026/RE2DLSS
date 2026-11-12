@@ -214,7 +214,7 @@ struct StageState {
     std::map<uint32_t, Constants> constants;  // root constants by parameter
 
     void Layout(pipeline_layout l) {
-        if (l == layout) return;
+        if (!l.handle || l == layout) return;
         layout = l;  // a new root signature resets every binding
         tables.clear();
         roots.clear();
@@ -415,18 +415,57 @@ resource PixelSrv(device* dev, const StageState& st, uint32_t reg) {
 }
 
 // The root CBV parameters holding SceneInfo (b0 space0), any shader stage.
+// Includes an AMD fallback when descriptor_tracking doesn't match the root parameter's register.
 std::vector<uint32_t> SceneInfoParams(device* dev, const StageState& st) {
     std::vector<uint32_t> out;
     descriptor_tracking* dt = dev->get_private_data<descriptor_tracking>();
-    if (!dt) return out;
-    for (const auto& [param, r] : st.roots) {
-        if (r.type != descriptor_type::constant_buffer) continue;
-        const pipeline_layout_param p = dt->get_pipeline_layout_param(st.layout, param);
-        if (p.type == pipeline_layout_param_type::push_descriptors && p.push_descriptors.dx_register_index == 0 &&
-            p.push_descriptors.dx_register_space == 0)
-            out.push_back(param);
+    if (dt) {
+        for (const auto& [param, r] : st.roots) {
+            if (r.type != descriptor_type::constant_buffer) continue;
+            const pipeline_layout_param p = dt->get_pipeline_layout_param(st.layout, param);
+            if (p.type == pipeline_layout_param_type::push_descriptors && p.push_descriptors.dx_register_index == 0 &&
+                p.push_descriptors.dx_register_space == 0)
+                out.push_back(param);
+        }
+    }
+    if (out.empty()) {
+        for (const auto& [param, r] : st.roots) {
+            if (r.type == descriptor_type::constant_buffer && r.range.buffer.handle != 0)
+                out.push_back(param);
+        }
     }
     return out;
+}
+
+// Searches bound descriptor tables for a CBV at b0 space0 (used when the driver/engine binds b0 via table).
+bool SceneInfoFromTable(device* dev, const StageState& st, buffer_range* outRange) {
+    descriptor_tracking* dt = dev->get_private_data<descriptor_tracking>();
+    if (!dt) return false;
+    for (uint32_t i = 0; i < st.tables.size(); ++i) {
+        if (!st.tables[i].handle) continue;
+        const pipeline_layout_param p = dt->get_pipeline_layout_param(st.layout, i);
+        if (p.type != pipeline_layout_param_type::descriptor_table || !p.descriptor_table.ranges) continue;
+        for (uint32_t r = 0; r < p.descriptor_table.count; ++r) {
+            const descriptor_range& range = p.descriptor_table.ranges[r];
+            if (range.type != descriptor_type::constant_buffer) continue;
+            if (range.dx_register_space != 0 || range.dx_register_index > 0 || range.count == 0) continue;
+            descriptor_heap heap = {0};
+            uint32_t offset = 0;
+            dev->get_descriptor_heap_offset(st.tables[i], range.binding + (0 - range.dx_register_index), 0, &heap, &offset);
+            const buffer_range br = dt->get_buffer_range(heap, offset);
+            if (br.buffer.handle != 0) {
+                *outRange = br;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool IsValidSceneInfo(const float* scene) {
+    const float sw = scene[kScreenSize];
+    const float sh = scene[kScreenSize + 1];
+    return std::isfinite(sw) && std::isfinite(sh) && sw >= 64.0f && sw <= 16384.0f && sh >= 64.0f && sh <= 16384.0f;
 }
 
 // ---------------------------------------------------------------- reading constant buffers
@@ -434,10 +473,9 @@ std::vector<uint32_t> SceneInfoParams(device* dev, const StageState& st) {
 // Constant buffers (SceneInfo) are read on the CPU when a pass is recorded. Usually they're in
 // upload memory and can be mapped. Some systems (seen on Radeon cards: "camera constants
 // (SceneInfo) not found") keep them in GPU-only memory, filled by a copy from upload memory:
-// once a buffer can't be mapped, buffer copies are noted, and such a buffer is read from the
-// upload buffer it was copied from (as in RE4DLSS 1.2.2).
+// buffer copies are tracked from start so the first TAA frame on Radeon can also be resolved.
 
-std::atomic<bool> g_trackCopies{false};
+std::atomic<bool> g_trackCopies{true};
 struct CopySource {
     uint64_t size;
     resource src;
@@ -550,13 +588,39 @@ void NoteSceneInfoRead(const std::string& how, bool ok) {
 }
 
 bool ReadSceneInfo(device* dev, const StageState& st, float* out) {
-    std::string how = "no SceneInfo constant buffer bound";
+    static float s_lastScene[kSceneInfoFloats] = {};
+    static bool s_hasValidScene = false;
+
+    std::string how = "no SceneInfo constant buffer bound (roots=" + std::to_string(st.roots.size()) +
+                      ", tables=" + std::to_string(st.tables.size()) + ")";
     for (uint32_t param : SceneInfoParams(dev, st)) {
         const buffer_range& b = st.roots.at(param).range;
         if (ReadBuffer(dev, b, kSceneInfoFloats * 4, out, &how)) {
-            NoteSceneInfoRead(how, true);
-            return true;
+            if (IsValidSceneInfo(out)) {
+                NoteSceneInfoRead(how + " [root param " + std::to_string(param) + "]", true);
+                memcpy(s_lastScene, out, sizeof(s_lastScene));
+                s_hasValidScene = true;
+                return true;
+            }
+            how += " (invalid screen size in root param " + std::to_string(param) + ")";
         }
+    }
+    buffer_range tableCb = {};
+    if (SceneInfoFromTable(dev, st, &tableCb)) {
+        if (ReadBuffer(dev, tableCb, kSceneInfoFloats * 4, out, &how)) {
+            if (IsValidSceneInfo(out)) {
+                NoteSceneInfoRead(how + " [descriptor table b0]", true);
+                memcpy(s_lastScene, out, sizeof(s_lastScene));
+                s_hasValidScene = true;
+                return true;
+            }
+            how += " (invalid screen size in table b0)";
+        }
+    }
+    if (s_hasValidScene) {
+        memcpy(out, s_lastScene, sizeof(s_lastScene));
+        NoteSceneInfoRead("fallback to cached SceneInfo (" + how + ")", true);
+        return true;
     }
     NoteSceneInfoRead(how, false);
     return false;
