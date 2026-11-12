@@ -73,6 +73,9 @@ namespace {
 // Resident Evil 2's shaders (docs/FINDINGS.md); the names are the same as Village's.
 constexpr uint32_t kTaaPs = 0x89b84994;      // PreTonemap2_PS: t1 depth, t2 colour, t3 history, t4 velocity
 constexpr uint32_t kTaaDepth = 1, kTaaColor = 2, kTaaMotion = 4;
+// The TAA's EffectMaskTex (t0, r8): where the game makes its TAA trust the current frame
+// (history weight AABlend - ResponsiveAARate * mask): particles and other effects. -1: none.
+constexpr int kTaaMask = 0;
 constexpr uint32_t kBloomPs = 0xdd975721;    // NewFinal
 constexpr bool kBloomIntoTaaOnly = false;     // (RE7's bloom shader also draws its smaller levels)
 constexpr uint32_t kTonemapPs = 0x0936c4dc;  // LDRPostProcess_WithTonemap (colour t0)
@@ -108,6 +111,8 @@ struct Settings {
     bool upscale = true;   // below the output size: DLSS to output size (else DLAA at render size)
     bool sharpen = true;   // the game's sharpening at output size when upscaling
     bool textureDetail = true;  // negative mip bias on material samplers (applied at game start)
+    bool gameExposure = true;   // DLSS/FSR get the colour's real exposure (1.0) instead of guessing it
+    bool effectMask = true;     // DLSS/FSR get the TAA's effect mask (games that have one)
     int mode = 0;          // DLSS mode setting the render scale through RE2DLSS.lua (0: the game's slider)
     // DLSS Ray Reconstruction in place of Super Resolution while the game ray traces (ini
     // RayReconstruction; experimental, off by default). rrPreset: NVSDK_NGX_RayReconstruction_Hint_Render_Preset_*
@@ -139,6 +144,8 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Upscale", g_set.upscale);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Sharpen", g_set.sharpen);
     reshade::get_config_value(nullptr, RD_PRODUCT, "TextureDetail", g_set.textureDetail);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     if (g_set.mode < 0 || g_set.mode >= kModeCount) g_set.mode = 0;
     reshade::get_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
@@ -157,6 +164,8 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Upscale", g_set.upscale);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Sharpen", g_set.sharpen);
     reshade::set_config_value(nullptr, RD_PRODUCT, "TextureDetail", g_set.textureDetail);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
     reshade::set_config_value(nullptr, RD_PRODUCT, "RrModel", g_set.rrPreset);
@@ -1302,6 +1311,38 @@ void OnBarrier(command_list* cl, uint32_t count, const resource* res, const reso
 
 // ---------------------------------------------------------------- passes
 
+// The exposure DLSS and FSR are told about: the TAA's colour is already exposed (the tonemapper
+// takes it as it is), so 1.0, in a 1x1 r32f texture made once. Without it they estimate an
+// exposure of their own (auto-exposure), which can pump and ghost when the lighting changes.
+resource g_exposureOne = {0};
+
+ID3D12Resource* ExposureOne(device* dev) {
+    if (!g_set.gameExposure) return nullptr;
+    if (!g_exposureOne.handle) {
+        float one = 1.0f;
+        subresource_data data = {&one, 4, 4};
+        if (!dev->create_resource(resource_desc(1, 1, 1, 1, format::r32_float, 1, memory_heap::default_,
+                                                resource_usage::shader_resource),
+                                  &data, resource_usage::shader_resource, &g_exposureOne)) {
+            g_exposureOne = {0};
+            static bool logged = false;
+            if (!logged) logged = true, Log("couldn't create the exposure texture: auto-exposure used");
+            return nullptr;
+        }
+        Log("DLSS/FSR exposure: the game's (1.0, the colour is already exposed)");
+    }
+    return reinterpret_cast<ID3D12Resource*>(g_exposureOne.handle);
+}
+
+// The TAA's effect mask, if this game has one and it's wanted.
+ID3D12Resource* EffectMask(device* dev, const ListState& s) {
+    if (kTaaMask < 0 || !g_set.effectMask) return nullptr;
+    const resource m = PixelSrv(dev, s.graphics, static_cast<uint32_t>(kTaaMask));
+    static bool logged = false;
+    if (!logged) logged = true, Log("DLSS/FSR effect mask: %s", m.handle ? "the TAA's EffectMaskTex" : "not found");
+    return reinterpret_cast<ID3D12Resource*>(m.handle);
+}
+
 bool OnTaa(command_list* cl, ListState& s) {
     device* dev = cl->get_device();
     const resource depth = PixelSrv(dev, s.graphics, kTaaDepth);
@@ -1368,6 +1409,8 @@ bool OnTaa(command_list* cl, ListState& s) {
         in.jitterX = jitterX, in.jitterY = jitterY;
         in.motionScaleX = 0.5f * renderW;  // NDC offsets, y up -> render pixels, y down
         in.motionScaleY = -0.5f * renderH;
+        in.exposure = ExposureOne(dev);
+        in.biasMask = EffectMask(dev, s);
         in.reset = reset;
         in.preset = g_set.preset;
         // Ray Reconstruction when the game ray traced this frame (rayTracingUpscale ran).
@@ -1410,6 +1453,8 @@ bool OnTaa(command_list* cl, ListState& s) {
         in.jitterX = jitterX, in.jitterY = jitterY;
         in.motionScaleX = 0.5f * renderW;
         in.motionScaleY = -0.5f * renderH;
+        in.exposure = ExposureOne(dev);
+        in.reactive = EffectMask(dev, s);
         const float nearZ = scene[kNearPlane], yScale = scene[kProjElement0 + 1];
         in.cameraNear = nearZ > 0 && nearZ < 10 ? nearZ : 0.01f;
         in.cameraFar = 0;  // RE Engine: reversed Z, infinite far plane
@@ -1718,6 +1763,8 @@ void DestroyAll(device* dev) {
     dlss::Shutdown();
     fsr::Shutdown();
     for (Texture* t : {&g_x, &g_y, &g_z, &g_hudScene}) Retire(*t);
+    if (g_exposureOne.handle) dev->destroy_resource(g_exposureOne);
+    g_exposureOne = {0};
     for (Old& o : g_old) {
         if (o.srv.handle) dev->destroy_resource_view(o.srv);
         if (o.rtv.handle) dev->destroy_resource_view(o.rtv);
@@ -2109,6 +2156,12 @@ void UpscalerOverlay() {
             Help("Below 100%, the game's sharpening (its Sharpness setting) runs on the upscaled image. Off: "
                  "only DLSS/FSR's own result.");
         }
+        changed |= ImGui::Checkbox("Use the game's exposure", &g_set.gameExposure);
+        Help("Tells DLSS and FSR the picture's real exposure instead of letting them estimate it: steadier "
+             "brightness and less ghosting when the lighting changes.");
+        changed |= ImGui::Checkbox("Use the game's effect mask", &g_set.effectMask);
+        Help("The mask the game makes for its own anti-aliasing (particles, fire, sparks, other effects): "
+             "DLSS and FSR 3.1 trust the current frame more there, against ghosting and smearing.");
         changed |= ImGui::Checkbox("Sharper textures at lower render resolutions", &g_set.textureDetail);
         Help("A mip bias of log2(render scale) on the game's material textures, as NVIDIA recommends. Set when "
              "the game starts: restart after changing the render resolution.");
