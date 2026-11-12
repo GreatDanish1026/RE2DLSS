@@ -112,6 +112,7 @@ struct Settings {
     bool sharpen = true;   // the game's sharpening at output size when upscaling
     bool textureDetail = true;  // negative mip bias on material samplers (applied at game start)
     bool gameExposure = true;   // DLSS/FSR get the colour's real exposure (1.0) instead of guessing it
+    bool fullResReflections = false;  // REFramework script: ray traced reflections at full resolution
     bool effectMask = true;     // DLSS/FSR get the TAA's effect mask (games that have one)
     int mode = 0;          // DLSS mode setting the render scale through RE2DLSS.lua (0: the game's slider)
     // DLSS Ray Reconstruction in place of Super Resolution while the game ray traces (ini
@@ -145,6 +146,7 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Sharpen", g_set.sharpen);
     reshade::get_config_value(nullptr, RD_PRODUCT, "TextureDetail", g_set.textureDetail);
     reshade::get_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FullResReflections", g_set.fullResReflections);
     reshade::get_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     if (g_set.mode < 0 || g_set.mode >= kModeCount) g_set.mode = 0;
@@ -165,6 +167,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Sharpen", g_set.sharpen);
     reshade::set_config_value(nullptr, RD_PRODUCT, "TextureDetail", g_set.textureDetail);
     reshade::set_config_value(nullptr, RD_PRODUCT, "GameExposure", g_set.gameExposure);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "FullResReflections", g_set.fullResReflections);
     reshade::set_config_value(nullptr, RD_PRODUCT, "EffectMask", g_set.effectMask);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
@@ -1870,6 +1873,33 @@ bool ScriptStatus(float* scale) {
     return true;
 }
 
+// Full-resolution ray traced reflections, set by the REFramework script (RE2DLSS.lua): the wanted
+// SpecularResolution (0 = full, -1 = the game's) in reframework/data/RE2DLSS_rt.txt.
+void WriteWantedRt() {
+    static int written = -2;
+    const int want = g_set.fullResReflections ? 0 : -1;
+    if (want == written) return;
+    const std::wstring fw = ExeDir() + L"reframework";
+    if (GetFileAttributesW(fw.c_str()) == INVALID_FILE_ATTRIBUTES) return;  // no REFramework
+    CreateDirectoryW((fw + L"\\data").c_str(), nullptr);
+    if (FILE* f = _wfopen((fw + L"\\data\\RE2DLSS_rt.txt").c_str(), L"w")) {
+        fprintf(f, "%d\n", want);
+        fclose(f);
+        written = want;
+        Log("reflections for RE2DLSS.lua: %s", want == 0 ? "full resolution" : "the game's resolution");
+    }
+}
+
+// The script's report: the reflections' resolution now (0 full, 1 half), or -1 if unknown.
+int RtResolutionNow() {
+    FILE* f = _wfopen((ExeDir() + L"reframework\\data\\RE2DLSS_rt_status.txt").c_str(), L"r");
+    if (!f) return -1;
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
 bool g_keyWasDown = false;
 bool g_wasEnabled = false;
 bool g_samplerStatsLogged = false;
@@ -1930,6 +1960,7 @@ bool UpscalerOnDraw(command_list* cl, uint32_t vertices, uint32_t instances) {
 }
 
 void UpscalerPresent(swapchain* sc) {
+    WriteWantedRt();
     dlss::EndFrame();
     fsr::EndFrame();
     if (g_frame % 600 == 599) {
@@ -2159,6 +2190,14 @@ void UpscalerOverlay() {
         changed |= ImGui::Checkbox("Use the game's exposure", &g_set.gameExposure);
         Help("Tells DLSS and FSR the picture's real exposure instead of letting them estimate it: steadier "
              "brightness and less ghosting when the lighting changes.");
+        changed |= ImGui::Checkbox("Full-resolution reflections", &g_set.fullResReflections);
+        Help("Ray traces reflections at the full render resolution instead of the game's reduced one: sharper "
+             "reflections, especially with Ray Reconstruction, at a GPU cost. Needs REFramework (the bundled "
+             "RE2DLSS.lua sets it) and the game's ray tracing on.");
+        if (g_set.fullResReflections) {
+            const int now = RtResolutionNow();
+            ImGui::TextDisabled("Reflections now: %s", now == 0 ? "full resolution" : now == 1 ? "half resolution" : "unknown (is REFramework running?)");
+        }
         changed |= ImGui::Checkbox("Use the game's effect mask", &g_set.effectMask);
         Help("The mask the game makes for its own anti-aliasing (particles, fire, sparks, other effects): "
              "DLSS and FSR 3.1 trust the current frame more there, against ghosting and smearing.");
