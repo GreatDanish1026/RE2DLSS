@@ -2360,7 +2360,7 @@ void UpscalerOverlay() {
         }
         changed |= ImGui::Checkbox("Use the game's exposure", &g_set.gameExposure);
         Help("Tells DLSS and FSR the picture's real exposure instead of letting them estimate it: steadier "
-             "brightness and less ghosting when the lighting changes.");
+             "brightness and less ghosting when the lighting changes. DLSS and FSR 3.1 only: FSR 4 measures its own.");
         changed |= ImGui::Checkbox("Use the game's effect mask", &g_set.effectMask);
         Help("The mask the game makes for its own anti-aliasing (particles, fire, sparks, other effects): "
              "DLSS and FSR 3.1 trust the current frame more there, against ghosting and smearing.");
