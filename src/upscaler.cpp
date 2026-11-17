@@ -52,6 +52,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -62,6 +63,7 @@
 #include "guide_cs.h"       // kGuideCs: guide.hlsl (Ray Reconstruction guides from the G-buffer)
 #include "guide_view_cs.h"  // kGuideViewCs: guide_view.hlsl (guide debug view)
 #include "rcas_cs.h"        // kRcasCs: rcas.hlsl (sharpening after DLSS)
+#include "mvfix_cs.h"       // kMvFixCs: mvfix.hlsl (motion vectors without the jitter)
 #include "dlss.hpp"
 #include "fsr.hpp"
 #include "version.h"
@@ -126,6 +128,11 @@ struct Settings {
     int rrPreset = 0;
     int rrDenoise = 0;
     int guideView = 0;
+    // From the DX11 versions (RE3DLSS-DX11): the game's velocity includes this frame's jitter (its
+    // FillVelocityPS uses the jittered viewProjInvMat; confirmed in RE2's DX12 build 2026-11-17), and
+    // it cycles 16 jitter positions where DLSS asks for 8 / scale^2 (32 at 50%).
+    bool mvFix = true;       // ini MotionFix: the jitter taken out of the motion vectors (mvfix.hlsl)
+    bool longJitter = true;  // ini LongJitter: while upscaling, 8 / scale^2 jitter positions
 } g_set;
 
 struct Mode {
@@ -159,6 +166,8 @@ void LoadSettings() {
     if (g_set.rrPreset != 0 && (g_set.rrPreset < 4 || g_set.rrPreset > 6)) g_set.rrPreset = 0;
     reshade::get_config_value(nullptr, RD_PRODUCT, "RrDenoise", g_set.rrDenoise);
     if (g_set.rrDenoise < 0 || g_set.rrDenoise > 2) g_set.rrDenoise = 0;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "MotionFix", g_set.mvFix);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "LongJitter", g_set.longJitter);
 }
 
 void SaveSettings() {
@@ -178,6 +187,8 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
     reshade::set_config_value(nullptr, RD_PRODUCT, "RrModel", g_set.rrPreset);
     reshade::set_config_value(nullptr, RD_PRODUCT, "RrDenoise", g_set.rrDenoise);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "MotionFix", g_set.mvFix);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "LongJitter", g_set.longJitter);
 }
 
 std::mutex g_statusMutex;
@@ -283,6 +294,8 @@ void OnBindTables(command_list* cl, shader_stage stages, pipeline_layout layout,
     for (uint32_t i = 0; i < count; ++i) st->tables[first + i] = tables[i];
 }
 
+void JitterOnBind(device* dev, pipeline_layout layout, uint32_t param, const buffer_range& r);
+
 void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout layout, uint32_t param,
                        const descriptor_table_update& u) {
     ListState* s = State(cl);
@@ -294,6 +307,8 @@ void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout la
     if (u.type == descriptor_type::constant_buffer || u.type == descriptor_type::buffer_shader_resource_view ||
         u.type == descriptor_type::buffer_unordered_access_view)
         st->roots[param] = {stages, u.type, *static_cast<const buffer_range*>(u.descriptors)};
+    if (u.type == descriptor_type::constant_buffer)
+        JitterOnBind(cl->get_device(), layout, param, *static_cast<const buffer_range*>(u.descriptors));
 }
 
 void OnPushConstants(command_list* cl, shader_stage stages, pipeline_layout layout, uint32_t param, uint32_t first,
@@ -1392,6 +1407,194 @@ void Sharpen(command_list* cl, device* dev) {
     if (!logged) logged = true, Log("DLSS output sharpened (RCAS, strength %.2f)", sharpness);
 }
 
+// ---------------------------------------------------------------- motion vectors without the jitter
+//
+// The game's velocity (rgba16snorm, NDC offset to the previous position, y up) includes this
+// frame's jitter. mvfix.hlsl writes g_mv (rg16f, render pixels) = velocity * (0.5 w, -0.5 h) +
+// jitter, which DLSS, Ray Reconstruction and FSR get with a motion scale of 1. In RE3DLSS-DX11 the
+// jitter left soft striped patches on still faces at Performance. g_resMutex held.
+Texture g_mv;
+resource_view g_mvUav = {0};
+uint64_t g_mvUavOf = 0;
+resource_view g_velSrv = {0};  // our view of the game's velocity texture
+uint64_t g_velSrvOf = 0;
+pipeline_layout g_mvLayout = {0};
+pipeline g_mvPipe = {0};
+bool g_mvFailed = false;
+
+bool MvFixReady(device* dev) {
+    if (g_mvPipe.handle) return true;
+    if (g_mvFailed) return false;
+    constant_range c = {};
+    c.count = 8;
+    c.visibility = shader_stage::all_compute;
+    descriptor_range srv = {};
+    srv.count = 1;
+    srv.visibility = shader_stage::all_compute;
+    srv.type = descriptor_type::shader_resource_view;
+    descriptor_range uav = srv;
+    uav.type = descriptor_type::unordered_access_view;
+    const pipeline_layout_param params[3] = {pipeline_layout_param(c), pipeline_layout_param(srv), pipeline_layout_param(uav)};
+    shader_desc cs = {};
+    cs.code = kMvFixCs;
+    cs.code_size = sizeof(kMvFixCs);
+    pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+    if (!dev->create_pipeline_layout(3, params, &g_mvLayout) || !dev->create_pipeline(g_mvLayout, 1, &sub, &g_mvPipe)) {
+        g_mvFailed = true;
+        g_mvPipe = {0};
+        Log("couldn't create the motion vector shader: the game's motion vectors are used as they are");
+        return false;
+    }
+    return true;
+}
+
+// The game's velocity -> g_mv. False: use the game's velocity as it is.
+bool FixMotion(command_list* cl, device* dev, resource velocity, uint32_t w, uint32_t h, float jitterPxX, float jitterPxY) {
+    if (!MvFixReady(dev)) return false;
+    const resource_usage usage = resource_usage::unordered_access | resource_usage::shader_resource;
+    if (!Ensure(dev, g_mv, w, h, format::r16g16_float, usage, resource_usage::unordered_access, "motion vector")) return false;
+    if (g_mvUavOf != g_mv.res.handle) {
+        if (g_mvUav.handle) dev->destroy_resource_view(g_mvUav);
+        g_mvUav = {0};
+        dev->create_resource_view(g_mv.res, resource_usage::unordered_access, resource_view_desc(format::r16g16_float), &g_mvUav);
+        g_mvUavOf = g_mv.res.handle;
+    }
+    if (g_velSrvOf != velocity.handle) {
+        if (g_velSrv.handle) dev->destroy_resource_view(g_velSrv);
+        g_velSrv = {0};
+        const format vf = format_to_default_typed(dev->get_resource_desc(velocity).texture.format);
+        dev->create_resource_view(velocity, resource_usage::shader_resource,
+                                  resource_view_desc(resource_view_type::texture_2d, vf, 0, 1, 0, 1), &g_velSrv);
+        g_velSrvOf = velocity.handle;
+    }
+    if (!g_mvUav.handle || !g_velSrv.handle) return false;
+    Transition(cl, g_mv, resource_usage::unordered_access);
+    struct {
+        float scaleX, scaleY, offsetX, offsetY;
+        uint32_t w, h, pad0, pad1;
+    } p = {0.5f * w, -0.5f * h, jitterPxX, jitterPxY, w, h, 0, 0};
+    cl->bind_pipeline(pipeline_stage::all_compute, g_mvPipe);
+    cl->push_constants(shader_stage::all_compute, g_mvLayout, 0, 0, 8, &p);
+    descriptor_table_update u = {};
+    u.count = 1;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = &g_velSrv;
+    cl->push_descriptors(shader_stage::all_compute, g_mvLayout, 1, u);
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = &g_mvUav;
+    cl->push_descriptors(shader_stage::all_compute, g_mvLayout, 2, u);
+    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    Transition(cl, g_mv, resource_usage::shader_resource);
+    static bool logged = false;
+    if (!logged) logged = true, Log("motion vectors: the jitter is taken out (mvfix.hlsl)");
+    return true;
+}
+
+// ---------------------------------------------------------------- longer jitter sequence
+//
+// The game cycles 16 jitter positions (logged 2026-11-17); DLSS wants about 8 / scale^2 (32 at
+// 50%). While upscaling, the main view's SceneInfo gets a Halton(2,3) sequence of that length. In
+// DX12 the game writes SceneInfo into a mapped upload buffer and binds it as a root constant buffer:
+// it is patched in place when it is bound (before the GPU reads it), so the game's draws, its
+// velocity pass, its TAA and the upscaler all see the same jitter. SceneInfo (floats, as RE2's DX11
+// build, checked against its capture):
+//   projElement[0].zw (42, 43): jitter in clip units (jitter x px = -z * w / 2, y px = w * h / 2);
+//   viewProjMat (0..15, row-major, row vectors): columns x and y carry -jitter x the w column;
+//   viewProjInvMat (56..71): its row 3 carries the inverse (+= dx * row 0 + dy * row 1);
+//   projInvElements[1].xy (52, 53): jitter / projElement[0].xy.
+// prevViewProjMat has no jitter, so motion vectors don't change.
+std::atomic<uint32_t> g_jitterW{0}, g_jitterH{0};  // the render size to patch at (0: not upscaling)
+std::atomic<uint32_t> g_jitterPhases{0};           // the sequence length in use (0: the game's)
+
+float Halton(uint32_t i, uint32_t b) {
+    float f = 1, r = 0;
+    while (i) {
+        f /= static_cast<float>(b);
+        r += f * static_cast<float>(i % b);
+        i /= b;
+    }
+    return r;
+}
+
+void PatchJitter(float* s, uint32_t w, uint32_t h) {
+    const float jx = s[kProjElement0 + 2], jy = s[kProjElement0 + 3], sw = s[kScreenSize], sh = s[kScreenSize + 1];
+    if (jx == 0 && jy == 0) return;  // views without jitter (shadows and the like)
+    if (sw != static_cast<float>(w) || sh != static_cast<float>(h)) return;  // not the main view at the render size
+    if (!(s[40] > 0.05f && s[40] < 50 && s[41] > 0.05f && s[41] < 50)) return;
+    if (std::fabs(jx) * sw > 2 || std::fabs(jy) * sh > 2) return;  // more than a pixel: not a jitter
+    if (!g_outW) return;
+    const float scale = sw / static_cast<float>(g_outW);
+    if (scale >= 0.99f) return;
+    uint32_t n = static_cast<uint32_t>(std::ceil(8.0f / (scale * scale)));
+    n = n < 8 ? 8 : n > 64 ? 64 : n;
+    const uint32_t i = static_cast<uint32_t>(g_frame % n) + 1;  // Halton skips index 0
+    const float px = Halton(i, 2) - 0.5f, py = Halton(i, 3) - 0.5f;
+    const float nx = -2 * px / sw, ny = 2 * py / sh;
+    const float dx = nx - jx, dy = ny - jy;
+    if (dx == 0 && dy == 0) return;  // already patched (the same SceneInfo bound again)
+    for (int r = 0; r < 4; ++r) {
+        s[r * 4 + 0] -= dx * s[r * 4 + 3];
+        s[r * 4 + 1] -= dy * s[r * 4 + 3];
+    }
+    for (int c = 0; c < 4; ++c) s[56 + 12 + c] += dx * s[56 + c] + dy * s[56 + 4 + c];
+    s[kProjElement0 + 2] = nx, s[kProjElement0 + 3] = ny;
+    s[52] = nx / s[40], s[53] = ny / s[41];
+    g_jitterPhases = n;
+    static std::atomic<uint32_t> logged{0};
+    if (logged.exchange(n) != n) Log("jitter: %u positions at %.0fx%.0f (the game's 16 replaced)", n, sw, sh);
+}
+
+// Upload buffers the game binds constant buffers from, mapped once (nullptr: not mappable).
+struct MappedCb {
+    uint8_t* data;
+    uint64_t size;
+};
+std::mutex g_cbMapMutex;
+std::unordered_map<uint64_t, MappedCb> g_cbMaps;
+
+// Each copy of SceneInfo is checked once per frame (the game binds the same one for many draws;
+// upload memory is slow to read).
+std::unordered_map<uint64_t, uint64_t> g_cbChecked;  // buffer handle ^ offset -> frame
+uint64_t g_cbCheckedFrame = ~0ull;
+
+// A root constant buffer the game binds: SceneInfo is b0 space0 (as SceneInfoParams).
+void JitterOnBind(device* dev, pipeline_layout layout, uint32_t param, const buffer_range& r) {
+    const uint32_t w = g_jitterW.load(std::memory_order_relaxed), h = g_jitterH.load(std::memory_order_relaxed);
+    if (!w || !r.buffer.handle || !g_set.enabled || !g_set.longJitter) return;
+    descriptor_tracking* dt = dev->get_private_data<descriptor_tracking>();
+    if (!dt) return;
+    const pipeline_layout_param p = dt->get_pipeline_layout_param(layout, param);
+    if (p.type != pipeline_layout_param_type::push_descriptors || p.push_descriptors.dx_register_index != 0 ||
+        p.push_descriptors.dx_register_space != 0)
+        return;
+    MappedCb m;
+    {
+        std::lock_guard<std::mutex> lock(g_cbMapMutex);
+        if (g_cbCheckedFrame != g_frame) g_cbChecked.clear(), g_cbCheckedFrame = g_frame;
+        uint64_t& seen = g_cbChecked[r.buffer.handle ^ (r.offset << 1)];
+        if (seen == g_frame + 1) return;
+        seen = g_frame + 1;
+        auto it = g_cbMaps.find(r.buffer.handle);
+        if (it == g_cbMaps.end()) {
+            const resource_desc d = dev->get_resource_desc(r.buffer);
+            void* p = nullptr;
+            MappedCb nm = {nullptr, d.buffer.size};
+            if (d.type == resource_type::buffer && d.heap != memory_heap::default_ &&
+                dev->map_buffer_region(r.buffer, 0, UINT64_MAX, map_access::read_write, &p) && p)
+                nm.data = static_cast<uint8_t*>(p);  // left mapped: upload buffers can stay mapped
+            it = g_cbMaps.emplace(r.buffer.handle, nm).first;
+        }
+        m = it->second;
+    }
+    if (!m.data || r.offset + kSceneInfoFloats * 4 > m.size) return;
+    PatchJitter(reinterpret_cast<float*>(m.data + r.offset), w, h);
+}
+
+void JitterOnDestroyResource(device*, resource r) {
+    std::lock_guard<std::mutex> lock(g_cbMapMutex);
+    g_cbMaps.erase(r.handle);
+}
+
 std::atomic<float> g_renderScale{1};  // render width / output width at the last TAA (1 when not upscaling)
 resource g_exposureOne = {0};
 
@@ -1465,6 +1668,9 @@ bool OnTaa(command_list* cl, ListState& s) {
     const bool upscale = g_set.upscale && g_outW && g_outH && renderW < g_outW && renderH < g_outH &&
                          renderW * 3 + 16 >= g_outW && renderH * 3 + 16 >= g_outH;  // DLSS goes down to a third (1278 x 3 = 3834)
     const uint32_t outW = upscale ? g_outW : td.texture.width, outH = upscale ? g_outH : td.texture.height;
+    // The longer jitter sequence for the next SceneInfo binds (this frame's are already recorded).
+    if (upscale && g_set.longJitter) g_jitterW = renderW, g_jitterH = renderH;
+    else g_jitterW = 0, g_jitterH = 0, g_jitterPhases = 0;
     const resource_usage usage = resource_usage::unordered_access | resource_usage::copy_source |
                                  resource_usage::shader_resource | resource_usage::render_target;
     if (!Ensure(dev, g_x, outW, outH, td.texture.format, usage, resource_usage::unordered_access, "DLSS output")) {
@@ -1473,6 +1679,28 @@ bool OnTaa(command_list* cl, ListState& s) {
     }
 
     const float jitterX = JitterX(scene, renderW), jitterY = JitterY(scene, renderH);
+    {
+        // How many different jitter positions the game cycles through (DLSS wants about 8 / scale^2:
+        // 32 at 50%), logged per render size from 256 frames; measured again while it reads as one
+        // (frames after a load). From the DX11 versions, where the game used 16.
+        static std::map<uint64_t, int> seen;
+        static uint32_t forW = 0, frames = 0;
+        static bool done = false, loggedStill = false;
+        if (forW != renderW) seen.clear(), forW = renderW, frames = 0, done = false;
+        if (!done) {
+            const int qx = static_cast<int>(std::lround(jitterX * 1000)), qy = static_cast<int>(std::lround(jitterY * 1000));
+            ++seen[(static_cast<uint64_t>(static_cast<uint32_t>(qx)) << 32) | static_cast<uint32_t>(qy)];
+            if (++frames == 256) {
+                const bool still = seen.size() <= 1;
+                const float s = static_cast<float>(renderW) / outW;
+                if (!still || !loggedStill)
+                    Log("jitter at %ux%u: %zu different positions in 256 frames (DLSS suggests %.0f at this scale)%s",
+                        renderW, renderH, seen.size(), 8.0f / (s * s), still ? "; measuring again" : "");
+                if (still) loggedStill = true, seen.clear(), frames = 0;
+                else done = true;
+            }
+        }
+    }
     const bool reset = CameraCut(scene);
     auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native());
     Transition(cl, g_x, resource_usage::unordered_access);
@@ -1480,20 +1708,31 @@ bool OnTaa(command_list* cl, ListState& s) {
                              Ensure(dev, g_xs, outW, outH, td.texture.format, usage, resource_usage::unordered_access,
                                     "DLSS output before sharpening");
     if (sharpenDlss) Transition(cl, g_xs, resource_usage::unordered_access);
+    // Motion for the upscaler: the game's velocity with this frame's jitter taken out (render
+    // pixels), else the velocity as it is, scaled by the upscaler.
+    ID3D12Resource* motionIn = reinterpret_cast<ID3D12Resource*>(motion.handle);
+    float mvScaleX = 0.5f * renderW, mvScaleY = -0.5f * renderH;  // NDC offsets, y up -> render pixels, y down
+    if (g_set.mvFix) {
+        const float rawJx = -scene[kProjElement0 + 2] * renderW * 0.5f, rawJy = scene[kProjElement0 + 3] * renderH * 0.5f;
+        if (FixMotion(cl, dev, motion, renderW, renderH, rawJx, rawJy)) {
+            motionIn = reinterpret_cast<ID3D12Resource*>(g_mv.res.handle);
+            mvScaleX = mvScaleY = 1.0f;
+        }
+    }
     bool ok;
     bool usedRr = false;
     if (tech == Tech::Dlss) {
         dlss::Inputs in;
         in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
         in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
-        in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+        in.motion = motionIn;
         in.output = reinterpret_cast<ID3D12Resource*>((sharpenDlss ? g_xs : g_x).res.handle);
         in.key = &g_x;  // one history, sharpened or not
         in.renderWidth = renderW, in.renderHeight = renderH;
         in.outputWidth = outW, in.outputHeight = outH;
         in.jitterX = jitterX, in.jitterY = jitterY;
-        in.motionScaleX = 0.5f * renderW;  // NDC offsets, y up -> render pixels, y down
-        in.motionScaleY = -0.5f * renderH;
+        in.motionScaleX = mvScaleX;
+        in.motionScaleY = mvScaleY;
         in.exposure = ExposureOne(dev);
         in.biasMask = EffectMask(dev, s);
         in.reset = reset;
@@ -1532,13 +1771,13 @@ bool OnTaa(command_list* cl, ListState& s) {
         fsr::Inputs in;
         in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
         in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
-        in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+        in.motion = motionIn;
         in.output = reinterpret_cast<ID3D12Resource*>(g_x.res.handle);
         in.renderWidth = renderW, in.renderHeight = renderH;
         in.outputWidth = outW, in.outputHeight = outH;
         in.jitterX = jitterX, in.jitterY = jitterY;
-        in.motionScaleX = 0.5f * renderW;
-        in.motionScaleY = -0.5f * renderH;
+        in.motionScaleX = mvScaleX;
+        in.motionScaleY = mvScaleY;
         in.exposure = ExposureOne(dev);
         in.reactive = EffectMask(dev, s);
         const float nearZ = scene[kNearPlane], yScale = scene[kProjElement0 + 1];
@@ -1848,9 +2087,21 @@ void DestroyAll(device* dev) {
     g_targetRtvs.clear();
     dlss::Shutdown();
     fsr::Shutdown();
-    for (Texture* t : {&g_x, &g_xs, &g_y, &g_z, &g_hudScene}) Retire(*t);
+    for (Texture* t : {&g_x, &g_xs, &g_y, &g_z, &g_hudScene, &g_mv}) Retire(*t);
     if (g_xUav.handle) dev->destroy_resource_view(g_xUav);
     g_xUav = {0}, g_xUavOf = 0;
+    if (g_mvUav.handle) dev->destroy_resource_view(g_mvUav);
+    if (g_velSrv.handle) dev->destroy_resource_view(g_velSrv);
+    g_mvUav = {0}, g_mvUavOf = 0, g_velSrv = {0}, g_velSrvOf = 0;
+    if (g_mvPipe.handle) dev->destroy_pipeline(g_mvPipe);
+    if (g_mvLayout.handle) dev->destroy_pipeline_layout(g_mvLayout);
+    g_mvPipe = {0}, g_mvLayout = {0};
+    g_jitterW = 0, g_jitterH = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_cbMapMutex);
+        g_cbMaps.clear();
+        g_cbChecked.clear();
+    }
     if (g_rcasPipe.handle) dev->destroy_pipeline(g_rcasPipe);
     if (g_rcasLayout.handle) dev->destroy_pipeline_layout(g_rcasLayout);
     g_rcasPipe = {0}, g_rcasLayout = {0};
@@ -2367,6 +2618,14 @@ void UpscalerOverlay() {
         changed |= ImGui::Checkbox("Sharper textures at lower render resolutions", &g_set.textureDetail);
         Help("A mip bias of log2(render scale) on the game's material textures, as NVIDIA recommends. It follows "
              "the render resolution as it changes, without a restart.");
+        changed |= ImGui::Checkbox("Motion vectors without the camera jitter", &g_set.mvFix);
+        Help("The game's motion vectors include each frame's camera jitter; DLSS and FSR want them without it. "
+             "With the jitter, DLSS can leave soft striped patches on still surfaces such as faces at Performance.");
+        changed |= ImGui::Checkbox("Longer jitter sequence", &g_set.longJitter);
+        Help("When upscaling, the game's 16 camera jitter positions are replaced by as many as DLSS asks for at "
+             "the render resolution (18 at Quality, 24 at Balanced, 32 at Performance), for more detail in still "
+             "scenes.");
+        if (g_set.longJitter && g_jitterPhases) ImGui::TextDisabled("Jitter positions now: %u", g_jitterPhases.load());
         ImGui::SeparatorText("Ray Reconstruction testing");
         ImGui::SetNextItemWidth(ControlWidth() * 1.4f);
         if (ImGui::Combo("Game's ray tracing denoiser", &g_set.rrDenoise, kRrDenoiseNames, 3)) {
@@ -2419,6 +2678,7 @@ void UpscalerInit() {
     reshade::register_event<reshade::addon_event::copy_buffer_region>(&CbOnCopyBuffer);
     reshade::register_event<reshade::addon_event::copy_resource>(&CbOnCopyResource);
     reshade::register_event<reshade::addon_event::destroy_resource>(&CbOnDestroyResource);
+    reshade::register_event<reshade::addon_event::destroy_resource>(&JitterOnDestroyResource);
     RegisterFrameGen();
     const float scale = g_set.enabled && g_set.mode > 0 ? kModes[g_set.mode].scale : StartupRenderScale();
     g_renderScale = scale;
@@ -2448,6 +2708,7 @@ void UpscalerShutdown() {
     reshade::unregister_event<reshade::addon_event::copy_buffer_region>(&CbOnCopyBuffer);
     reshade::unregister_event<reshade::addon_event::copy_resource>(&CbOnCopyResource);
     reshade::unregister_event<reshade::addon_event::destroy_resource>(&CbOnDestroyResource);
+    reshade::unregister_event<reshade::addon_event::destroy_resource>(&JitterOnDestroyResource);
     UnregisterFrameGen();
 }
 
