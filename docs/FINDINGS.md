@@ -104,3 +104,21 @@ ray-traced frame, 4 of 4 signals handed over in the skip modes, models D/E/F, cu
 of the denoise choices **the game's denoiser with RR on top looked best**: the half-resolution
 signal without the game's temporal filtering comes out blotchier. So RrDenoise defaults to 0; the
 skip modes stay in Advanced as experiments.
+
+## Motion vectors without the jitter; longer jitter tried and dropped (2026-11-17)
+
+Dumped (docs/shaders/mv): the velocity pass FillVelocityPS (ps5ad41227, vs155a16c9) rebuilds each
+pixel's position with SceneInfo.viewProjInvMat (jittered) and projects it with prevViewProjMat
+(not jittered), as in the DX11 builds: the velocity includes this frame's jitter. cscfac1d07 /
+csff5416f8 then post-process it. The game cycles 16 jitter positions at every render size
+(logged: 16 at 2561x1440, 2227x1252 and 1920x1080).
+
+- Motion fix (kept, ini MotionFix, on): mvfix.hlsl (from RE3DLSS-DX11) writes rg16f motion in
+  render pixels without the jitter for DLSS, Ray Reconstruction and FSR. Frame generation keeps the
+  game's velocity.
+- Longer jitter (dropped): SceneInfo patched in place in the game's upload buffer whenever a root
+  constant buffer at b0 space0 was bound, with RE3DLSS-DX11's maths. It reached the TAA (33
+  positions at 1920x1080 in 256 frames), but the picture shimmered and flickered (user, with ray
+  traced reflections and Ray Reconstruction on); off made it go away. Something still used the
+  game's own jitter: likely the ray tracing passes' camera data, or SceneInfo bound through
+  descriptor tables. Not tested with ray tracing off.
