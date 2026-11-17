@@ -1,4 +1,4 @@
-# RE2DLSS 1.3.2
+# RE2DLSS 1.3.3
 
 ReShade add-on for **Resident Evil 2** (DirectX 12) that replaces the game's TAA
 with **NVIDIA DLSS** or **AMD FSR 3.1 / FSR 4**, and adds **DLSS or FSR frame generation** and
@@ -40,6 +40,10 @@ support, and REFramework for the render resolution dropdown.
   (1.3.0 gave it the game's too, which crashed games on Radeon cards).
 - **Effect mask** (on by default, Advanced tab): the mask the game's own anti-aliasing uses for particles, fire, sparks and other effects goes to DLSS and FSR 3.1,
   which then trust the current frame more there: less ghosting and smearing on effects.
+- **Motion vectors without the camera jitter** (on by default, Advanced tab; 1.3.3): the game's motion vectors
+  include each frame's camera jitter; DLSS, Ray Reconstruction, FSR and frame generation now get them without it.
+  With the jitter, DLSS left soft blocky patches on still faces at Performance, and Ray Reconstruction could
+  flicker on characters. A second switch keeps frame generation on the game's own motion vectors.
 - **Full-resolution reflections** (off by default, Settings tab): the bundled REFramework script
   makes the game ray trace its reflections at the full render resolution instead of a reduced one:
   sharper reflections, especially with Ray Reconstruction, at a GPU cost.
@@ -61,7 +65,7 @@ Settings, Status and Advanced tabs. They're saved in `ReShade.ini` under `[RE2DL
 
 ## Install
 
-**With Fluffy Mod Manager**: put `RE2DLSS-1.3.2.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
+**With Fluffy Mod Manager**: put `RE2DLSS-1.3.3.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
 folder (or drag it onto the manager) and enable it. It installs into the game folder:
 
 - `RE2DLSS.addon64` (the add-on), `nvngx_dlss.dll` and `nvngx_dlssd.dll` (NVIDIA's DLSS and
