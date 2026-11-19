@@ -121,14 +121,15 @@ struct Settings {
     int mode = 0;          // DLSS mode setting the render scale through RE2DLSS.lua (0: the game's slider)
     // DLSS Ray Reconstruction in place of Super Resolution while the game ray traces (ini
     // RayReconstruction; off by default). rrPreset: NVSDK_NGX_RayReconstruction_Hint_Render_Preset_*
-    // (ini RrModel, 0 = NVIDIA's default). rrDenoise (ini RrDenoise): which of the game's ray tracing
+    // (ini RrModel, 0 = NVIDIA's default). rrDenoise (ini RrDenoiser): which of the game's ray tracing
     // denoise passes are skipped: 0 none, 1 all but the spatial ones (they fill the sparse rays), 2 all.
-    // Default 1 since 2026-11-17: with the motion vectors fixed it looked best (user, RE2); the ini key
-    // changed from RrDenoise so everyone moves to it once.
+    // 1 looked best with the Graphics Enhancement script's ray tracing quality (user, RE2, 2026-11-17)
+    // but noisy at the game's own (sparse half-size rays): 3 Auto (default since 2026-11-19, ini key
+    // RrDenoiser so everyone moves to it once) picks 1 when the game traces at the render size, else 0.
     // guideView: debug view of one guide (not saved).
     bool rr = false;
     int rrPreset = 0;
-    int rrDenoise = 1;
+    int rrDenoise = 3;
     int guideView = 0;
     // From the DX11 versions (RE3DLSS-DX11): the game's velocity includes this frame's jitter (its
     // FillVelocityPS uses the jittered viewProjInvMat; confirmed in RE2's DX12 build 2026-11-17).
@@ -167,8 +168,8 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
     reshade::get_config_value(nullptr, RD_PRODUCT, "RrModel", g_set.rrPreset);
     if (g_set.rrPreset != 0 && (g_set.rrPreset < 4 || g_set.rrPreset > 6)) g_set.rrPreset = 0;
-    reshade::get_config_value(nullptr, RD_PRODUCT, "RrDenoiseMode", g_set.rrDenoise);
-    if (g_set.rrDenoise < 0 || g_set.rrDenoise > 2) g_set.rrDenoise = 1;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "RrDenoiser", g_set.rrDenoise);
+    if (g_set.rrDenoise < 0 || g_set.rrDenoise > 3) g_set.rrDenoise = 3;
     reshade::get_config_value(nullptr, RD_PRODUCT, "MotionFix", g_set.mvFix);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FgMotionFix", g_set.fgMvFix);
 }
@@ -189,7 +190,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Mode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
     reshade::set_config_value(nullptr, RD_PRODUCT, "RrModel", g_set.rrPreset);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "RrDenoiseMode", g_set.rrDenoise);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "RrDenoiser", g_set.rrDenoise);
     reshade::set_config_value(nullptr, RD_PRODUCT, "MotionFix", g_set.mvFix);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FgMotionFix", g_set.fgMvFix);
 }
@@ -883,8 +884,11 @@ constexpr uint32_t kRtTemporalVfx = 0xc67ec41e;       // rayTracingTemporalFilte
 constexpr uint32_t kRtUpscale = 0xe120127f;           // rayTracingUpscale: t2 base colour, t3 normal, t5-t8 signals
 constexpr uint32_t kUpBase = 2, kUpNormal = 3, kUpSignal = 5;  // t5 shY, t6 cocg, t7 specular, t8 VFX specular
 
-const char* const kRrDenoiseNames[] = {"Game's denoiser, Ray Reconstruction on top",
-                                       "Skip all but the spatial passes (recommended)", "Skip all: raw rays (experimental)"};
+const char* const kRrDenoiseNames[] = {"Game's denoiser, Ray Reconstruction on top", "Skip all but the spatial passes",
+                                       "Skip all: raw rays (experimental)", "Auto (recommended)"};
+constexpr int kRrDenoiseAuto = 3;
+// The combo lists Auto first.
+constexpr int kRrDenoiseOrder[] = {kRrDenoiseAuto, 0, 1, 2};
 const char* const kGuideViewNames[] = {"Off", "Diffuse albedo", "Specular albedo", "Normals", "Roughness"};
 constexpr int kGuideViewCount = 5;
 
@@ -907,7 +911,43 @@ struct RtState {
     pipeline pipe = {0}, viewPipe = {0};
     bool pipesFailed = false;
     bool loggedMatrices = false;
+    // Auto denoiser: how big the game traces (the shading passes' outputs) against the render size
+    // (rayTracingUpscale's G-buffer). Dense (traced at the render size, as with the Graphics
+    // Enhancement script's ray tracing quality): Ray Reconstruction does the temporal denoising.
+    // Sparse (the game's own half size): the game's denoiser stays. Changes after 30 frames.
+    uint32_t specW = 0, specH = 0, diffW = 0, diffH = 0;
+    bool dense = false, denseKnown = false;
+    int denseVotes = 0;
 } g_rt;
+
+// The denoiser setting in effect (Auto resolved). g_rtMutex held.
+int RrDenoise() {
+    if (g_set.rrDenoise != kRrDenoiseAuto) return g_set.rrDenoise;
+    return g_rt.dense ? 1 : 0;
+}
+
+// At rayTracingUpscale: the traced size against the render size. g_rtMutex held.
+void RtJudgeDensity(device* dev) {
+    if (!g_rt.base.handle || !g_rt.specW) return;
+    const resource_desc bd = dev->get_resource_desc(g_rt.base);
+    const uint32_t rw = bd.texture.width, rh = bd.texture.height;
+    if (!rw || !rh) return;
+    // The larger of the two traced signals decides (the specular one in RE2's own settings).
+    const uint32_t tw = g_rt.diffW > g_rt.specW ? g_rt.diffW : g_rt.specW;
+    const uint32_t th = g_rt.diffW > g_rt.specW ? g_rt.diffH : g_rt.specH;
+    const bool dense = tw * 10 >= rw * 9 && th * 10 >= rh * 9;
+    if (g_rt.denseKnown && dense == g_rt.dense) {
+        g_rt.denseVotes = 0;
+        return;
+    }
+    if (g_rt.denseKnown && ++g_rt.denseVotes < 30) return;
+    g_rt.denseVotes = 0;
+    g_rt.dense = dense;
+    g_rt.denseKnown = true;
+    Log("ray tracing traced at %ux%u (specular) / %ux%u (diffuse) for a %ux%u render: %s; Auto denoiser: %s",
+        g_rt.specW, g_rt.specH, g_rt.diffW, g_rt.diffH, rw, rh, dense ? "dense" : "sparse",
+        kRrDenoiseNames[dense ? 1 : 0]);
+}
 
 void RtWatch(resource r) {
     if (r.handle && !g_rt.states.count(r.handle)) g_rt.states[r.handle] = resource_usage::undefined;
@@ -987,7 +1027,7 @@ bool RrChosen() {
 // The game's denoise passes are skipped while Ray Reconstruction ran last frame (so the first frame
 // with it, and every frame after it stops, keeps the game's).
 bool RtSkipping(uint64_t frame) {
-    return RrChosen() && g_set.rrDenoise > 0 && g_rt.rrFrame != UINT64_MAX && g_rt.rrFrame + 2 >= frame;
+    return RrChosen() && RrDenoise() > 0 && g_rt.rrFrame != UINT64_MAX && g_rt.rrFrame + 2 >= frame;
 }
 
 bool RtIsSkipped(uint32_t id) {
@@ -996,7 +1036,7 @@ bool RtIsSkipped(uint32_t id) {
         case kRtTemporalVfx:
             return true;
         case kRtSpatialDiffuse: case kRtSpatialSpecular: case kRtSpatialVfx: case kRtVfxMedian:
-            return g_set.rrDenoise == 2;
+            return RrDenoise() == 2;
         default:
             return false;
     }
@@ -1041,7 +1081,15 @@ bool RtOnDispatch(command_list* cl, ListState& s, uint32_t id) {
         frame = g_frame;
     }
     std::lock_guard<std::mutex> lock(g_rtMutex);
-    const bool raw = g_set.rrDenoise == 2;
+    const bool raw = RrDenoise() == 2;
+    auto traced = [&](uint32_t* w, uint32_t* h) {  // the shading pass's u0 size (Auto denoiser)
+        const resource r = ComputeView(dev, s.compute, 0, true);
+        if (!r.handle) return;
+        const resource_desc d = dev->get_resource_desc(r);
+        *w = d.texture.width, *h = d.texture.height;
+    };
+    if (id == kRtShadeSpecular) traced(&g_rt.specW, &g_rt.specH);
+    if (id == kRtShadeDiffuse) traced(&g_rt.diffW, &g_rt.diffH);
     auto note = [&](int slot, resource r) {
         if (g_rt.signalFrame != frame) {
             for (resource& x : g_rt.signal) x = {0};
@@ -1064,6 +1112,7 @@ bool RtOnDispatch(command_list* cl, ListState& s, uint32_t id) {
         g_rt.upscaleFrame = frame;
         g_rt.base = ComputeView(dev, s.compute, kUpBase, false);
         g_rt.normal = ComputeView(dev, s.compute, kUpNormal, false);
+        RtJudgeDensity(dev);  // for the next frame's passes (this frame's have run)
         if (skipping && g_rt.signalFrame == frame) {
             int copied = 0;
             for (uint32_t i = 0; i < 4; ++i) {
@@ -1076,7 +1125,7 @@ bool RtOnDispatch(command_list* cl, ListState& s, uint32_t id) {
         return false;
     }
     if (skipping && RtIsSkipped(id)) {
-        if (!g_rt.skipped++) Log("Ray Reconstruction: skipping the game's ray tracing denoise passes (%s)", kRrDenoiseNames[g_set.rrDenoise]);
+        if (!g_rt.skipped++) Log("Ray Reconstruction: skipping the game's ray tracing denoise passes (%s)", kRrDenoiseNames[RrDenoise()]);
         return true;
     }
     return false;
@@ -2663,18 +2712,35 @@ void UpscalerOverlay() {
         Help("Frame generation (DLSS-G, FSR) gets the same motion vectors without the jitter, as NVIDIA and AMD "
              "want. Off: the game's own, with the jitter.");
         ImGui::SeparatorText("Ray Reconstruction testing");
-        ImGui::SetNextItemWidth(ControlWidth() * 1.4f);
-        if (ImGui::Combo("Game's ray tracing denoiser", &g_set.rrDenoise, kRrDenoiseNames, 3)) {
-            changed = true;
-            Log("Ray Reconstruction denoising setting: %s", kRrDenoiseNames[g_set.rrDenoise]);
+        {
+            int shown = 0;
+            for (int i = 0; i < 4; ++i)
+                if (kRrDenoiseOrder[i] == g_set.rrDenoise) shown = i;
+            const char* items[4];
+            for (int i = 0; i < 4; ++i) items[i] = kRrDenoiseNames[kRrDenoiseOrder[i]];
+            ImGui::SetNextItemWidth(ControlWidth() * 1.4f);
+            if (ImGui::Combo("Game's ray tracing denoiser", &shown, items, 4)) {
+                g_set.rrDenoise = kRrDenoiseOrder[shown];
+                changed = true;
+                Log("Ray Reconstruction denoising setting: %s", kRrDenoiseNames[g_set.rrDenoise]);
+            }
         }
         Help("While Ray Reconstruction runs, which of the game's own ray tracing denoise passes still run.\n"
-             "Skip all but the spatial passes (recommended, looked best in testing): the game's frame-to-frame\n"
-             "(temporal) filtering, variance and deflicker are skipped, so Ray Reconstruction does the\n"
-             "denoising over time; the game's spatial passes still fill in the sparse rays (global\n"
-             "illumination is traced with a quarter of the rays). Game's denoiser: everything stays and Ray\n"
-             "Reconstruction cleans up the result. Skip all: Ray Reconstruction gets the raw rays (blotchier:\n"
-             "the game traces at half resolution).");
+             "Auto (recommended): skip all but the spatial passes when the game traces at the render resolution\n"
+             "(as with a higher ray tracing quality from the Graphics Enhancement script), else keep the game's\n"
+             "denoiser: at the game's own quality the rays are traced at half resolution and too sparse for\n"
+             "Ray Reconstruction alone (noisy).\n"
+             "Skip all but the spatial passes: the game's frame-to-frame (temporal) filtering, variance and\n"
+             "deflicker are skipped, so Ray Reconstruction does the denoising over time; the game's spatial\n"
+             "passes still fill in the sparse rays. Game's denoiser: everything stays and Ray Reconstruction\n"
+             "cleans up the result. Skip all: Ray Reconstruction gets the raw rays (blotchy).");
+        if (g_set.rrDenoise == kRrDenoiseAuto && g_set.rr) {
+            std::lock_guard<std::mutex> lock(g_rtMutex);
+            if (g_rt.denseKnown)
+                ImGui::TextDisabled("Auto is using: %s (rays traced at %ux%u)", kRrDenoiseNames[RrDenoise()],
+                                    g_rt.diffW > g_rt.specW ? g_rt.diffW : g_rt.specW,
+                                    g_rt.diffW > g_rt.specW ? g_rt.diffH : g_rt.specH);
+        }
         ImGui::SetNextItemWidth(ControlWidth());
         if (ImGui::Combo("Show guide", &g_set.guideView, kGuideViewNames, kGuideViewCount))
             Log("diagnosis: show guide %s", kGuideViewNames[g_set.guideView]);
