@@ -1,4 +1,4 @@
-# RE2DLSS 1.3.3
+# RE2DLSS 1.3.4
 
 ReShade add-on for **Resident Evil 2** (DirectX 12) that replaces the game's TAA
 with **NVIDIA DLSS** or **AMD FSR 3.1 / FSR 4**, and adds **DLSS or FSR frame generation** and
@@ -53,10 +53,13 @@ support, and REFramework for the render resolution dropdown.
   NVIDIA's DLSS Ray Reconstruction 310.9.16 replaces DLSS Super Resolution. It upscales and cleans up
   the noise in the ray-traced reflections and lighting, with guides built from the game's
   G-buffer and camera. **Ray Reconstruction model**:
-  NVIDIA's default, D, E or F; an override in the NVIDIA App takes precedence. By default the game's
-  frame-to-frame denoising is skipped and Ray Reconstruction does it (the game's spatial passes
-  still fill in its sparse rays); the Advanced tab can keep the game's whole denoiser instead, or
-  skip all of it. Advanced also shows the surface pictures Ray
+  NVIDIA's default, D, E or F; an override in the NVIDIA App takes precedence. By default (Auto,
+  1.3.4) the add-on looks at how finely the game ray traces: at the render resolution (as with a
+  Graphics Enhancement script's higher ray tracing quality) the game's frame-to-frame denoising is
+  skipped and Ray Reconstruction does it; at the game's own, smaller size the rays are too sparse
+  for that, so the game's denoiser stays and Ray Reconstruction cleans up after it. The Advanced tab
+  can choose either always, or skip all of the game's denoiser.
+  Advanced also shows the surface pictures Ray
   Reconstruction gets (colour, reflectivity, normals, roughness). Without ray tracing it uses
   Super Resolution.
 
@@ -65,7 +68,7 @@ Settings, Status and Advanced tabs. They're saved in `ReShade.ini` under `[RE2DL
 
 ## Install
 
-**With Fluffy Mod Manager**: put `RE2DLSS-1.3.3.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
+**With Fluffy Mod Manager**: put `RE2DLSS-1.3.4.zip` in Fluffy Mod Manager's `Games\RE2R\Mods`
 folder (or drag it onto the manager) and enable it. It installs into the game folder:
 
 - `RE2DLSS.addon64` (the add-on), `nvngx_dlss.dll` and `nvngx_dlssd.dll` (NVIDIA's DLSS and
@@ -101,6 +104,7 @@ If the NVIDIA App has a DLSS model override for the game, it takes precedence ov
 - Works with REFramework: REFramework hooks NVIDIA's frame generation DLL in a way that would hang
   the game at launch; the add-on steps around that hook while the game's swapchain is created.
 - FSR 3.1/4 and FSR frame generation through this add-on are untested on Radeon cards so far.
+- AMD Radeon (DirectX 12): 1.3.4 finds the camera constants on Radeon systems too (fix contributed by a Radeon user, RE7DLSS pull request #3); before, some Radeon systems reported "camera constants (SceneInfo) not found" and the add-on stayed off. Not tested on Radeon here.
 - A few frames during loading may show the game's own upscaling; that's expected.
 - The render scale the dropdown sets is the game's Image Quality setting, so the game saves it in
   `re2_config.ini`. With upscaling off (F9) or the dropdown on "Game's Image Quality slider", the
