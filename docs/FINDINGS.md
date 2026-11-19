@@ -122,3 +122,12 @@ csff5416f8 then post-process it. The game cycles 16 jitter positions at every re
   traced reflections and Ray Reconstruction on); off made it go away. Something still used the
   game's own jitter: likely the ray tracing passes' camera data, or SceneInfo bound through
   descriptor tables. Not tested with ray tracing off.
+
+## AMD Radeon: camera constants (2026-11-19, from RE7DLSS pull request #3)
+
+Ported from RE7DLSS (merge 731079c): buffers are mapped by their D3D12 heap properties (ReBAR / Smart
+Access Memory GPU-upload heaps count as CPU-readable), a CBV b0 bound through a descriptor table is
+found too, copies into GPU-only constant buffers keep their bytes once tracking starts, and only the
+pass's own SceneInfo is used (no older frame, no compute bindings). Not tested on Radeon by us.
+RE2DLSS replaces the earlier merged pull request #3 (reverted: stale SceneInfo cache, any-root-CBV
+fallback) with this version.
