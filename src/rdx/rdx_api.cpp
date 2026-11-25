@@ -7,6 +7,8 @@
 
 #include <algorithm>
 
+#include "descriptor_tracking.hpp"
+
 namespace rdx {
 
 namespace {
@@ -112,7 +114,12 @@ Queue* QueueOf(void* native) { return native ? g_queues.Get(native) : nullptr; }
 Swapchain* SwapchainOf(void* native) { return native ? g_swapchains.Get(native) : nullptr; }
 
 Device* CreateDeviceWrapper(ID3D12Device* d) {
-    if (!g_device) g_device = new Device(d);
+    if (!g_device) {
+        g_device = new Device(d);
+        // ReShade's descriptor_tracking utility attaches itself to every device; the add-on asks
+        // the device for it (stateless here: rdx tracks the descriptors).
+        g_device->create_private_data<descriptor_tracking>();
+    }
     return g_device;
 }
 

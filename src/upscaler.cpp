@@ -1721,6 +1721,16 @@ bool OnTaa(command_list* cl, ListState& s) {
     const resource motion = PixelSrv(dev, s.graphics, kTaaMotion);
     const resource target = ViewResource(s.rtvs[0]);
     if (!depth.handle || !color.handle || !motion.handle || !target.handle) {
+        static int diag = 0;
+        if (diag++ < 3) {
+            Slot sl;
+            const bool slotOk = PixelSrvSlot(dev, s.graphics, kTaaColor, &sl);
+            Log("TAA inputs: depth %s colour %s velocity %s target %s (layout %llx, %zu tables, colour slot %s view %llx, rtv %llx)",
+                depth.handle ? "ok" : "missing", color.handle ? "ok" : "missing", motion.handle ? "ok" : "missing",
+                target.handle ? "ok" : "missing", static_cast<unsigned long long>(s.graphics.layout.handle), s.graphics.tables.size(),
+                slotOk ? "found" : "not found", static_cast<unsigned long long>(sl.view.handle),
+                static_cast<unsigned long long>(s.rtvs[0].handle));
+        }
         Fail("TAA inputs not found (depth, colour, velocity or render target)");
         return false;
     }
