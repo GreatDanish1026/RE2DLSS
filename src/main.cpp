@@ -38,6 +38,7 @@
 // The rdx hook layer (src/rdx), in place of ReShade since 2.0.
 reshade::api::device* rdx_GameDevice();
 void rdx_InstallEarly(HMODULE self);
+extern bool rdx_Blocked;  // 1.x still installed (rdx_overlay.cpp shows why nothing runs)
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS in place of " RD_GAME "'s TAA (in development).";
@@ -989,6 +990,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             g_loadTick = GetTickCount64();
             OpenLog();
             g_self = module;
+            // 1.x (the ReShade add-on) still installed: it would replace the TAA too. 2.0 stays out of
+            // the way (no hooks) and says so in its menu until RE2DLSS.addon64 is removed.
+            if (GetFileAttributesW((g_exeDir + L"RE2DLSS.addon64").c_str()) != INVALID_FILE_ATTRIBUTES) {
+                Log("RE2DLSS 1.x (RE2DLSS.addon64, ReShade add-on) is still installed: 2.0 is off until it's removed");
+                rdx_Blocked = true;
+                break;
+            }
             rdx_InstallEarly(module);  // the game's D3D12 calls (REFramework loads us before it makes its device)
             g_veh = AddVectoredExceptionHandler(1, &OnException);
             LoadDumpList();

@@ -2026,7 +2026,7 @@ void DrawFrameGenAdvanced() {
         Log("settings: Reflex wait before input %s", g_set.reflexAtInput ? "on" : "off");
     }
     Help("With DLSS frame generation (on by default): Reflex's wait happens on the game's own thread right before it "
-         "reads input (keyboard and mouse, controllers), through the RE2DLSS_Reflex plugin for REFramework, instead of on "
+         "reads input (keyboard and mouse, controllers), through REFramework (RE2DLSS is its plugin), instead of on "
          "the render thread after the game has already read the frame's input. In testing (Resident Evil 4) it cut the time from input to "
          "the finished frame by about 14 ms. Off: the wait on the render thread, as in earlier versions. Switches right away.");
 }
@@ -2083,7 +2083,7 @@ extern "C" __declspec(dllexport) void RE2DLSS_GameFrameStart() {
     g_refFrameAt = Now();
     if (!g_refLogged) {
         g_refLogged = true;
-        Log("Reflex at input: frame start from REFramework's input update (RE2DLSS_Reflex plugin), thread %lu",
+        Log("Reflex at input: frame start from REFramework's input update, thread %lu",
             static_cast<unsigned long>(GetCurrentThreadId()));
     }
     g_refToken = GameFrameStart();

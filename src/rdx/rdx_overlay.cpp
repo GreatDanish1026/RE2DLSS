@@ -152,8 +152,17 @@ void rd_LogPlugin(bool pre, bool post, bool ui, int apiMinor) {
 }
 
 // REFramework's menu (plugin API on_imgui_draw_ui): REFramework's ImGui frame and window are current.
+bool rdx_Blocked = false;
+
 void rdx_OnDrawUi(void* refwModule) {
-    if (!rdx::g_overlay || !Init(static_cast<HMODULE>(refwModule))) return;
+    if (!Init(static_cast<HMODULE>(refwModule))) return;
     if (!g_ig.CollapsingHeader("RE2DLSS", 0)) return;
-    rdx::g_overlay(nullptr);
+    if (rdx_Blocked) {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "%s",
+                           "RE2DLSS 1.x is still installed (RE2DLSS.addon64 next to re2.exe, a ReShade add-on).\n"
+                           "2.0 replaces it and stays off until it's removed: uninstall 1.x in Fluffy Mod Manager\n"
+                           "(or delete RE2DLSS.addon64 and reframework\\plugins\\RE2DLSS_Reflex.dll), then restart the game.");
+        return;
+    }
+    if (rdx::g_overlay) rdx::g_overlay(nullptr);
 }
