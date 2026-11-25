@@ -55,7 +55,10 @@ bool Resolve() {
     const DWORD now = GetTickCount();
     if (g_looked && now - lastTry < 1000) return false;  // look again about once a second
     g_looked = true, lastTry = now;
-    HMODULE addon = GetModuleHandleA(RD_PRODUCT ".addon64");
+    // 2.0: the add-on is this same DLL (the REFramework plugin).
+    HMODULE addon = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&Resolve), &addon);
     if (!addon) return false;
     g_before = reinterpret_cast<Fn>(GetProcAddress(addon, RD_PRODUCT "_GameFrameStart"));
     g_after = reinterpret_cast<Fn>(GetProcAddress(addon, RD_PRODUCT "_GameInputRead"));

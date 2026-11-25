@@ -33,7 +33,11 @@
 
 #include "common.hpp"
 #include "version.h"
-#include "../third_party/reshade/utils/descriptor_tracking.hpp"
+#include <descriptor_tracking.hpp>  // rdx's (src/rdx)
+
+// The rdx hook layer (src/rdx), in place of ReShade since 2.0.
+reshade::api::device* rdx_GameDevice();
+void rdx_InstallEarly(HMODULE self);
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS in place of " RD_GAME "'s TAA (in development).";
@@ -968,6 +972,11 @@ uint32_t PipelinePs(pipeline pipe) {
 }
 
 resource ViewResource(resource_view view) {
+    // 2.0: the rdx layer follows every descriptor (copies included), as the game wrote it.
+    if (device* dev = rdx_GameDevice()) {
+        const resource r = dev->get_resource_from_view(view);
+        if (r.handle) return r;
+    }
     ViewInfo info;
     return FindView(view, &info) ? info.res : resource{0};
 }
@@ -977,10 +986,10 @@ resource ViewResource(resource_view view) {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
-            if (!reshade::register_addon(module)) return FALSE;
             g_loadTick = GetTickCount64();
             OpenLog();
             g_self = module;
+            rdx_InstallEarly(module);  // the game's D3D12 calls (REFramework loads us before it makes its device)
             g_veh = AddVectoredExceptionHandler(1, &OnException);
             LoadDumpList();
             reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
@@ -1016,7 +1025,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             rd::UpscalerShutdown();
             if (g_veh) RemoveVectoredExceptionHandler(g_veh);
             descriptor_tracking::unregister_events();
-            reshade::unregister_addon(module);
             if (g_log) fclose(g_log);
             break;
     }

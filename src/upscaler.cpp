@@ -57,7 +57,7 @@
 #include <string>
 #include <vector>
 
-#include "../third_party/reshade/utils/descriptor_tracking.hpp"
+#include <descriptor_tracking.hpp>  // rdx's (src/rdx)
 #include "blit_ps.h"  // kBlitPs, kBlitVs: blit.hlsl compiled by build.ps1
 #include "blit_vs.h"
 #include "guide_cs.h"       // kGuideCs: guide.hlsl (Ray Reconstruction guides from the G-buffer)
