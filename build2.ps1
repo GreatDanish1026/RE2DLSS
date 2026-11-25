@@ -39,7 +39,7 @@ $inc = "/I `"$root\src\rdx`" /I `"$obj`" /I `"$root\src`" /I `"$root\third_party
        "/I `"$root\third_party\fidelityfx\api\include`" /I `"$root\third_party\fidelityfx\upscalers\include`" " +
        "/I `"$root\third_party\fidelityfx\framegeneration\include`""
 $sources = @("main.cpp", "upscaler.cpp", "dlss.cpp", "fsr.cpp", "framegen.cpp", "fsrfg.cpp", "refplugin.cpp",
-             "rdx\rdx_events.cpp", "rdx\rdx_track.cpp", "rdx\rdx_api.cpp", "rdx\rdx_hooks.cpp") |
+             "rdx\rdx_events.cpp", "rdx\rdx_track.cpp", "rdx\rdx_api.cpp", "rdx\rdx_hooks.cpp", "rdx\rdx_overlay.cpp") |
            ForEach-Object { "`"$root\src\$_`"" }
 $cmd = (@("call `"$vcvars`" >nul") + $shaders + @(
     ("cl /nologo /c /O2 /MT /W3 /Fo`"$obj\\`" `"$root\src\rdx\rdx_slots.c`""),
