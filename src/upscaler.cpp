@@ -1862,6 +1862,17 @@ bool OnTaa(command_list* cl, ListState& s) {
                 in.viewToClip = viewToClip;
             }
         }
+        if (g_set.rr) {  // the log says when and why Ray Reconstruction stops and starts (issue #4)
+            static std::string loggedWhy = "?";
+            const std::string why = in.rr ? std::string() : g_rt.error.empty() ? std::string("the guides weren't made") : g_rt.error;
+            if (why != loggedWhy) {
+                if (why.empty()) Log("Ray Reconstruction running");
+                else
+                    Log("Ray Reconstruction off: %s (ray tracing pass last seen %lld frame(s) ago)", why.c_str(),
+                        g_rt.upscaleFrame == UINT64_MAX ? -1ll : static_cast<long long>(g_frame - g_rt.upscaleFrame));
+                loggedWhy = why;
+            }
+        }
         ok = dlss::Evaluate(list, in, err);
         if (ok && sharpenDlss) Sharpen(cl, dev);
         if (ok && in.rr) {
