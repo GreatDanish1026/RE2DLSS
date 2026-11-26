@@ -1070,6 +1070,40 @@ bool RtCopy(command_list* cl, resource src, resource dst) {
     return true;
 }
 
+// REFramework's path tracing (Graphics > Ray Tracing Tweaks: Pure / Hybrid Path Tracing, the engine's
+// via.render.ExperimentalRayTrace modes) replaces the ray tracing chain above with one inline ray
+// query compute pass at render size, one shader per bounce count and samples per pixel (no DXR):
+// t0 depth, t9 BaseColorMetallic (rgba8 sRGB), t10 NormalXNormalYRoughnessMisc (rgb10a2), u0 the
+// scene colour it writes (r11g11b10f), which the TAA then reads. It isn't denoised. Recognised by
+// those bindings (each shader checked once), so every variant is found.
+constexpr uint32_t kPtBase = 9, kPtNormal = 10;
+std::map<uint32_t, bool> g_ptShaders;  // shader id -> is a path tracing pass; g_rtMutex
+
+bool RtIsPathTracePass(device* dev, ListState& s, uint32_t id) {
+    const auto it = g_ptShaders.find(id);
+    if (it != g_ptShaders.end()) return it->second;
+    const resource out = ComputeView(dev, s.compute, 0, true);
+    if (!out.handle) return false;  // nothing bound: decide another time
+    const resource base = ComputeView(dev, s.compute, kPtBase, false), normal = ComputeView(dev, s.compute, kPtNormal, false);
+    bool pt = false;
+    if (base.handle && normal.handle) {
+        const resource_desc od = dev->get_resource_desc(out), bd = dev->get_resource_desc(base), nd = dev->get_resource_desc(normal);
+        const auto same = [&](const resource_desc& d) {
+            return d.type == resource_type::texture_2d && d.texture.width == od.texture.width && d.texture.height == od.texture.height;
+        };
+        const format bf = bd.texture.format, nf = nd.texture.format;
+        pt = od.type == resource_type::texture_2d && od.texture.format == format::r11g11b10_float && od.texture.width >= 640 &&
+             same(bd) && same(nd) &&
+             (bf == format::r8g8b8a8_unorm_srgb || bf == format::r8g8b8a8_unorm || bf == format::r8g8b8a8_typeless) &&
+             (nf == format::r10g10b10a2_unorm || nf == format::r10g10b10a2_typeless);
+        if (pt)
+            Log("path tracing pass cs%08x: %ux%u, G-buffer t%u/t%u: Ray Reconstruction denoises it", id, od.texture.width,
+                od.texture.height, kPtBase, kPtNormal);
+    }
+    g_ptShaders[id] = pt;
+    return pt;
+}
+
 // Every compute dispatch: notes the signals and the G-buffer, skips the game's denoise passes, and
 // copies the signals in before rayTracingUpscale. True: the dispatch is skipped.
 bool RtOnDispatch(command_list* cl, ListState& s, uint32_t id) {
@@ -1106,6 +1140,14 @@ bool RtOnDispatch(command_list* cl, ListState& s, uint32_t id) {
         case kRtSpatialSpecular: if (!raw) note(2, ComputeView(dev, s.compute, 0, true)); break;
         case kRtSpatialVfx: if (!raw) note(3, ComputeView(dev, s.compute, 0, true)); break;
         default: break;
+    }
+    if (id != kRtUpscale && RtIsPathTracePass(dev, s, id)) {
+        // The path traced lighting is the scene colour the TAA reads: Ray Reconstruction denoises it
+        // there, with guides from the G-buffer the path tracer reads.
+        g_rt.upscaleFrame = frame;
+        g_rt.base = ComputeView(dev, s.compute, kPtBase, false);
+        g_rt.normal = ComputeView(dev, s.compute, kPtNormal, false);
+        return false;
     }
     const bool skipping = RtSkipping(frame);
     if (id == kRtUpscale) {
