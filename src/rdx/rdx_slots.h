@@ -71,6 +71,8 @@ enum RdxSlot {
     /* IDXGIFactory2 */
     kFactoryCreateSwapChain,
     kFactoryCreateSwapChainForHwnd,
+    kFactoryCreateSwapChainForCoreWindow,
+    kFactoryCreateSwapChainForComposition,
     /* IDXGISwapChain3 */
     kScPresent,
     kScResizeBuffers,
