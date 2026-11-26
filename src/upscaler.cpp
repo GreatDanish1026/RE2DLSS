@@ -900,6 +900,7 @@ struct RtState {
     resource base = {0}, normal = {0};   // its G-buffer
     uint64_t rrFrame = UINT64_MAX;       // g_frame when Ray Reconstruction last ran
     uint64_t rrFrames = 0, skipped = 0, copied = 0;
+    uint64_t lateFrames = 0;             // Ray Reconstruction frames whose ray tracing pass came before the last Present
     std::string error;                   // why Ray Reconstruction isn't running (overlay)
     std::map<uint64_t, resource_usage> states;  // last recorded state of the textures above
     std::map<std::pair<uint64_t, uint32_t>, resource_view> views;  // ours, by resource and kind/format
@@ -1833,15 +1834,25 @@ bool OnTaa(command_list* cl, ListState& s) {
         in.biasMask = EffectMask(dev, s);
         in.reset = reset;
         in.preset = g_set.preset;
-        // Ray Reconstruction when the game ray traced this frame (rayTracingUpscale ran).
+        // Ray Reconstruction when the game ray traced this frame (rayTracingUpscale ran). g_frame
+        // moves on at Present, but the game records its passes on its own threads: rayTracingUpscale
+        // can be recorded before a Present and the TAA after it, so it looked a frame old. Depending
+        // on timing that was every frame or only after a while (Ray Reconstruction never or no longer
+        // running, "the game isn't ray tracing" with ray tracing on: issue #4). The previous frame counts.
         std::lock_guard<std::mutex> rtLock(g_rtMutex);
         static float worldToView[16], viewToClip[16];
         if (g_set.rr) {
             std::string why;
+            const bool tracedNow = g_rt.upscaleFrame == g_frame;
+            const bool tracedLast = g_rt.upscaleFrame != UINT64_MAX && g_rt.upscaleFrame + 1 == g_frame;
             if (!dlss::RrAvailable(&why)) g_rt.error = why;
-            else if (g_rt.upscaleFrame != g_frame) g_rt.error = "the game isn't ray tracing (turn on ray-traced reflections)";
+            else if (!tracedNow && !tracedLast) g_rt.error = "the game isn't ray tracing (turn on ray-traced reflections)";
             else if (!RtMatrices(scene, worldToView, viewToClip)) g_rt.error = "camera matrices not as expected (see the log)";
             else if (RtBuildGuides(cl, depth, scene, renderW, renderH)) {
+                if (!tracedNow && !g_rt.lateFrames++)
+                    Log("Ray Reconstruction: the ray tracing pass was recorded before the last Present (frame %llu, TAA in "
+                        "%llu): counted for this frame",
+                        static_cast<unsigned long long>(g_rt.upscaleFrame), static_cast<unsigned long long>(g_frame));
                 in.rr = true;
                 in.rrPreset = g_set.rrPreset;
                 in.diffuseAlbedo = reinterpret_cast<ID3D12Resource*>(g_rt.guide[0].handle);
@@ -1858,6 +1869,9 @@ bool OnTaa(command_list* cl, ListState& s) {
             g_rt.error.clear();
             g_rt.rrFrame = g_frame;
             if (!g_rt.rrFrames++) Log("DLSS Ray Reconstruction: first frame (%ux%u -> %ux%u)", renderW, renderH, outW, outH);
+            if (g_rt.rrFrames % 3600 == 0)
+                Log("DLSS Ray Reconstruction: %llu frames, %llu of them with the ray tracing pass before the last Present",
+                    static_cast<unsigned long long>(g_rt.rrFrames), static_cast<unsigned long long>(g_rt.lateFrames));
             if (g_set.guideView > 0) {
                 cl->bind_descriptor_tables(shader_stage::all_compute, s.compute.layout, 0, 0, nullptr);  // ReShade's heaps back
                 RtShowGuide(cl, g_x.res, g_set.guideView, renderW, renderH);
@@ -2686,10 +2700,10 @@ void UpscalerOverlay() {
         if (g_set.enabled && !err.empty()) ImGui::TextColored(kWarn, "Last problem: %s", err.c_str());
         if (g_set.rr) {
             std::lock_guard<std::mutex> lock(g_rtMutex);
-            ImGui::TextDisabled("Ray Reconstruction frames %llu; game's ray tracing denoise passes skipped %llu, "
-                                "signals handed over %llu times",
-                                static_cast<unsigned long long>(g_rt.rrFrames), static_cast<unsigned long long>(g_rt.skipped),
-                                static_cast<unsigned long long>(g_rt.copied));
+            ImGui::TextDisabled("Ray Reconstruction frames %llu (%llu with the ray tracing pass a frame behind); game's ray "
+                                "tracing denoise passes skipped %llu, signals handed over %llu times",
+                                static_cast<unsigned long long>(g_rt.rrFrames), static_cast<unsigned long long>(g_rt.lateFrames),
+                                static_cast<unsigned long long>(g_rt.skipped), static_cast<unsigned long long>(g_rt.copied));
         }
         DrawFrameGenStatus();
         ImGui::EndTabItem();
