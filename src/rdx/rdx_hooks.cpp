@@ -987,6 +987,108 @@ CreateSwapChainFn g_fgCreate = nullptr;
 CreateSwapChainForHwndFn g_fgCreateForHwnd = nullptr;
 thread_local int t_scDepth = 0;
 
+// The swapchain slots patched in DXGI's class vtable, which every swapchain of that class shares.
+// The Steam overlay inline-hooks the functions a new swapchain's vtable points at while that
+// swapchain is created. For the game's swapchain those are DXGI's own (patched only afterwards);
+// but when something else creates one later (REFramework's dummy swapchain at its first frame,
+// made with CreateSwapChainForComposition), the shared vtable points at our hooks and Steam
+// hooks them too. Its way back to the "original" then leads to our hook, which calls DXGI's
+// Steam-hooked function, which comes back to our hook... until the stack overflows (0xc00000fd in
+// HkResize a few seconds after start). So while any later swapchain is created, through any of
+// the factory's creation calls, the shared slots hold DXGI's functions again (HiddenSwapchainHooks).
+struct ScSlot {
+    void** slot;
+    void* orig;
+    void* hook;
+    bool hidden;
+};
+std::vector<ScSlot> g_scSlots;  // under g_vtMutex
+
+// Each hooked swapchain's class vtable. Another hooker can give a swapchain a vtable of its own,
+// copied from ours (REFramework does at its first Present: a per-object vtable hook whose
+// "original" Present is our HkPresent). The swapchain's vtable then isn't one we know, so
+// OrigFor() found nothing and HkPresent called address 0 (access violation, then the game hangs).
+// The originals are then looked up through the vtable the swapchain had when we hooked it.
+constexpr int kMaxSwapchains = 16;
+std::atomic<void*> g_scObj[kMaxSwapchains];
+std::atomic<void**> g_scVt[kMaxSwapchains];
+
+inline void* OrigForVt(void** vt, RdxSlot s) {
+    for (VtEntry& e : g_vts) {
+        void** v = e.vt.load(std::memory_order_acquire);
+        if (v == vt) return e.orig[s];
+        if (!v) break;
+    }
+    return nullptr;
+}
+
+template <typename F>
+F ScO(void* sc, RdxSlot s) {
+    if (void* p = OrigFor(sc, s)) return reinterpret_cast<F>(p);
+    for (int i = 0; i < kMaxSwapchains; ++i)
+        if (g_scObj[i].load(std::memory_order_acquire) == sc)
+            if (void* p = OrigForVt(g_scVt[i].load(std::memory_order_acquire), s)) return reinterpret_cast<F>(p);
+    return nullptr;
+}
+
+void RememberSwapchainVt(void* obj, void** vt) {
+    int freeSlot = -1;
+    for (int i = 0; i < kMaxSwapchains; ++i) {
+        void* o = g_scObj[i].load();
+        if (o == obj) {
+            g_scVt[i].store(vt, std::memory_order_release);
+            return;
+        }
+        if (!o && freeSlot < 0) freeSlot = i;
+    }
+    const int i = freeSlot >= 0 ? freeSlot : 0;  // full (swapchains are never forgotten): reuse the first
+    g_scVt[i].store(vt, std::memory_order_release);
+    g_scObj[i].store(obj, std::memory_order_release);
+}
+
+void WriteSlot(void** slot, void* value) {
+    DWORD old;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return;
+    *slot = value;
+    VirtualProtect(slot, sizeof(void*), old, &old);
+}
+
+// Patch() for a swapchain, remembering the slots so HiddenSwapchainHooks can put DXGI's back.
+void PatchSwapchain(void* obj, std::initializer_list<Hook> hooks) {
+    Patch(obj, hooks);
+    void** vt = *static_cast<void***>(obj);
+    RememberSwapchainVt(obj, vt);
+    std::lock_guard<std::mutex> lock(g_vtMutex);
+    for (const Hook& h : hooks) {
+        void** slot = vt + g_slot[h.slot];
+        void* orig = OrigFor(obj, h.slot);
+        if (*slot != h.fn || !orig) continue;
+        if (std::none_of(g_scSlots.begin(), g_scSlots.end(), [&](const ScSlot& s) { return s.slot == slot; }))
+            g_scSlots.push_back({slot, orig, h.fn, false});
+    }
+}
+
+// While it lives, the patched swapchain slots point at DXGI's functions. A Present or resize the
+// game makes meanwhile on another thread goes straight to DXGI, without the add-on's events.
+struct HiddenSwapchainHooks {
+    HiddenSwapchainHooks() {
+        std::lock_guard<std::mutex> lock(g_vtMutex);
+        int n = 0;
+        for (ScSlot& s : g_scSlots)
+            if (*s.slot == s.hook) WriteSlot(s.slot, s.orig), s.hidden = true, ++n;
+        if (n) Log("another swapchain is being created: %d swapchain hooks set aside meanwhile", n);
+    }
+    ~HiddenSwapchainHooks() {
+        std::lock_guard<std::mutex> lock(g_vtMutex);
+        for (ScSlot& s : g_scSlots) {
+            if (s.hidden && *s.slot == s.orig) WriteSlot(s.slot, s.hook);  // unless someone else hooked it meanwhile
+            s.hidden = false;
+        }
+    }
+    HiddenSwapchainHooks(const HiddenSwapchainHooks&) = delete;
+    HiddenSwapchainHooks& operator=(const HiddenSwapchainHooks&) = delete;
+};
+
 color_space FromDxgi(DXGI_COLOR_SPACE_TYPE cs) {
     switch (cs) {
         case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709: return color_space::scrgb;
@@ -1001,7 +1103,7 @@ HRESULT STDMETHODCALLTYPE HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
         if (!(flags & DXGI_PRESENT_TEST))
             Invoke<addon_event::present>(static_cast<command_queue*>(w->queue()), static_cast<swapchain*>(w), static_cast<const rect*>(nullptr),
                                          static_cast<const rect*>(nullptr), 0u, static_cast<const rect*>(nullptr));
-    return O<decltype(&HkPresent)>(sc, kScPresent)(sc, sync, flags);
+    return ScO<decltype(&HkPresent)>(sc, kScPresent)(sc, sync, flags);
 }
 
 HRESULT STDMETHODCALLTYPE HkPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
@@ -1009,13 +1111,13 @@ HRESULT STDMETHODCALLTYPE HkPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
         if (!(flags & DXGI_PRESENT_TEST))
             Invoke<addon_event::present>(static_cast<command_queue*>(w->queue()), static_cast<swapchain*>(w), static_cast<const rect*>(nullptr),
                                          static_cast<const rect*>(nullptr), 0u, static_cast<const rect*>(nullptr));
-    return O<decltype(&HkPresent1)>(sc, kScPresent1)(sc, sync, flags, p);
+    return ScO<decltype(&HkPresent1)>(sc, kScPresent1)(sc, sync, flags, p);
 }
 
 HRESULT STDMETHODCALLTYPE HkResize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags) {
     Swapchain* sw = SwapchainOf(sc);
     if (sw) Invoke<addon_event::destroy_swapchain>(static_cast<swapchain*>(sw), true);
-    const HRESULT hr = O<decltype(&HkResize)>(sc, kScResizeBuffers)(sc, n, w, h, f, flags);
+    const HRESULT hr = ScO<decltype(&HkResize)>(sc, kScResizeBuffers)(sc, n, w, h, f, flags);
     if (sw && SUCCEEDED(hr)) Invoke<addon_event::init_swapchain>(static_cast<swapchain*>(sw), true);
     return hr;
 }
@@ -1023,13 +1125,13 @@ HRESULT STDMETHODCALLTYPE HkResize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, D
 HRESULT STDMETHODCALLTYPE HkResize1(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags, const UINT* mask, IUnknown* const* queues) {
     Swapchain* sw = SwapchainOf(sc);
     if (sw) Invoke<addon_event::destroy_swapchain>(static_cast<swapchain*>(sw), true);
-    const HRESULT hr = O<decltype(&HkResize1)>(sc, kScResizeBuffers1)(sc, n, w, h, f, flags, mask, queues);
+    const HRESULT hr = ScO<decltype(&HkResize1)>(sc, kScResizeBuffers1)(sc, n, w, h, f, flags, mask, queues);
     if (sw && SUCCEEDED(hr)) Invoke<addon_event::init_swapchain>(static_cast<swapchain*>(sw), true);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HkSetColorSpace(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE cs) {
-    const HRESULT hr = O<decltype(&HkSetColorSpace)>(sc, kScSetColorSpace1)(sc, cs);
+    const HRESULT hr = ScO<decltype(&HkSetColorSpace)>(sc, kScSetColorSpace1)(sc, cs);
     if (SUCCEEDED(hr))
         if (Swapchain* w = SwapchainOf(sc)) {
             w->colorSpace = FromDxgi(cs);
@@ -1052,10 +1154,10 @@ void NewSwapchain(IUnknown* obj, IUnknown* queue, HWND wnd) {
     IUnknown* q = QueueOf(queue) ? queue : (g_firstDirectQueue ? reinterpret_cast<IUnknown*>(g_firstDirectQueue->d3d()) : queue);
     Swapchain* w = CreateSwapchainWrapper(sc, q, wnd);
     if (!w) return;
-    Patch(sc, {{kScPresent, P(&HkPresent)}, {kScResizeBuffers, P(&HkResize)}});
+    PatchSwapchain(sc, {{kScPresent, P(&HkPresent)}, {kScResizeBuffers, P(&HkResize)}});
     IDXGISwapChain3* sc3 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) {
-        Patch(sc3, {{kScPresent1, P(&HkPresent1)}, {kScResizeBuffers1, P(&HkResize1)}, {kScSetColorSpace1, P(&HkSetColorSpace)}});
+        PatchSwapchain(sc3, {{kScPresent1, P(&HkPresent1)}, {kScResizeBuffers1, P(&HkResize1)}, {kScSetColorSpace1, P(&HkSetColorSpace)}});
         sc3->Release();
     }
     OnDestroyedDxgi(sc, &SwapchainGone, w);
@@ -1072,7 +1174,11 @@ HRESULT STDMETHODCALLTYPE HkCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI
     auto orig = O<decltype(&HkCreateSwapChain)>(f, kFactoryCreateSwapChain);
     if (t_scDepth > 0) return orig(f, dev, desc, out);
     ++t_scDepth;
-    const HRESULT hr = g_fgCreate ? g_fgCreate(f, dev, desc, out) : orig(f, dev, desc, out);
+    HRESULT hr;
+    {
+        HiddenSwapchainHooks hidden;
+        hr = g_fgCreate ? g_fgCreate(f, dev, desc, out) : orig(f, dev, desc, out);
+    }
     --t_scDepth;
     if (SUCCEEDED(hr) && out && *out) NewSwapchain(*out, dev, desc ? desc->OutputWindow : nullptr);
     return hr;
@@ -1083,10 +1189,30 @@ HRESULT STDMETHODCALLTYPE HkCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND 
     auto orig = O<decltype(&HkCreateForHwnd)>(f, kFactoryCreateSwapChainForHwnd);
     if (t_scDepth > 0) return orig(f, dev, wnd, desc, fs, output, out);
     ++t_scDepth;
-    const HRESULT hr = g_fgCreateForHwnd ? g_fgCreateForHwnd(f, dev, wnd, desc, fs, output, out) : orig(f, dev, wnd, desc, fs, output, out);
+    HRESULT hr;
+    {
+        HiddenSwapchainHooks hidden;
+        hr = g_fgCreateForHwnd ? g_fgCreateForHwnd(f, dev, wnd, desc, fs, output, out) : orig(f, dev, wnd, desc, fs, output, out);
+    }
     --t_scDepth;
     if (SUCCEEDED(hr) && out && *out) NewSwapchain(*out, dev, wnd);
     return hr;
+}
+
+// Swapchains not for a window (the game doesn't make these; REFramework makes its dummy one with
+// CreateSwapChainForComposition): not followed, only made with our swapchain hooks set aside.
+HRESULT STDMETHODCALLTYPE HkCreateForCoreWindow(IDXGIFactory2* f, IUnknown* dev, IUnknown* wnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                IDXGIOutput* output, IDXGISwapChain1** out) {
+    auto orig = O<decltype(&HkCreateForCoreWindow)>(f, kFactoryCreateSwapChainForCoreWindow);
+    HiddenSwapchainHooks hidden;
+    return orig(f, dev, wnd, desc, output, out);
+}
+
+HRESULT STDMETHODCALLTYPE HkCreateForComposition(IDXGIFactory2* f, IUnknown* dev, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output,
+                                                 IDXGISwapChain1** out) {
+    auto orig = O<decltype(&HkCreateForComposition)>(f, kFactoryCreateSwapChainForComposition);
+    HiddenSwapchainHooks hidden;
+    return orig(f, dev, desc, output, out);
 }
 
 // The original swapchain creation for whichever factory class it's called on (handed to framegen).
@@ -1116,7 +1242,10 @@ void HookSystemFactory() {
             Log("couldn't create a DXGI factory: swapchain events unavailable");
             return;
         }
-        Patch(f, {{kFactoryCreateSwapChain, P(&HkCreateSwapChain)}, {kFactoryCreateSwapChainForHwnd, P(&HkCreateForHwnd)}});
+        Patch(f, {{kFactoryCreateSwapChain, P(&HkCreateSwapChain)},
+                  {kFactoryCreateSwapChainForHwnd, P(&HkCreateForHwnd)},
+                  {kFactoryCreateSwapChainForCoreWindow, P(&HkCreateForCoreWindow)},
+                  {kFactoryCreateSwapChainForComposition, P(&HkCreateForComposition)}});
         f->Release();
         Log("DXGI swapchain creation hooked");
     });

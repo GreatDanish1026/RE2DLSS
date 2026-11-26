@@ -77,6 +77,8 @@ void RdxFillSlots(int* s) {
 
     s[kFactoryCreateSwapChain] = SLOT(IDXGIFactory2Vtbl, CreateSwapChain);
     s[kFactoryCreateSwapChainForHwnd] = SLOT(IDXGIFactory2Vtbl, CreateSwapChainForHwnd);
+    s[kFactoryCreateSwapChainForCoreWindow] = SLOT(IDXGIFactory2Vtbl, CreateSwapChainForCoreWindow);
+    s[kFactoryCreateSwapChainForComposition] = SLOT(IDXGIFactory2Vtbl, CreateSwapChainForComposition);
 
     s[kScPresent] = SLOT(IDXGISwapChain3Vtbl, Present);
     s[kScResizeBuffers] = SLOT(IDXGISwapChain3Vtbl, ResizeBuffers);
