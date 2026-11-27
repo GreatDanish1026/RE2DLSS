@@ -2376,7 +2376,10 @@ void WriteWantedScale() {
 }
 
 // The script's last report: the current scale, and whether it's recent (the script is running).
-bool ScriptStatus(float* scale) {
+// Also, when asked: whether the game's FidelityFX Super Resolution is on (1, 0; -1 unknown or an
+// older script) and on how many frames something else had set another scale, which the script
+// put back before rendering.
+bool ScriptStatus(float* scale, int* fidelityFx = nullptr, int* outside = nullptr) {
     const std::wstring path = DataDir() + L"RE2DLSS_status.txt";
     WIN32_FILE_ATTRIBUTE_DATA a;
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
@@ -2388,11 +2391,44 @@ bool ScriptStatus(float* scale) {
     FILE* f = _wfopen(path.c_str(), L"r");
     if (!f) return false;
     float v = -1;
-    const int got = fscanf(f, "%f", &v);
+    int frame = 0, ffx = -1, out = 0;
+    const int got = fscanf(f, "%f %d %d %d", &v, &frame, &ffx, &out);
     fclose(f);
-    if (got != 1) return false;
+    if (got < 1) return false;
     *scale = v;
+    if (fidelityFx) *fidelityFx = got >= 3 ? ffx : -1;
+    if (outside) *outside = got >= 4 ? out : 0;
     return true;
+}
+
+// The game's FidelityFX Super Resolution sets the render size itself while it's on, so the Render
+// resolution setting does nothing then (issue #4). The script's last word on it: 1, 0, -1 unknown.
+std::atomic<int> g_fidelityFx{-1};
+
+// Every 2 s while a mode is set: the script's report into the log (FidelityFX switched on or off;
+// outside writes it held off, logged at 1, 2, 4, 8... of them).
+void CheckScriptStatus() {
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 2000) return;
+    last = now;
+    float scale = 0;
+    int ffx = -1, outside = 0;
+    if (!ScriptStatus(&scale, &ffx, &outside)) return;
+    g_fidelityFx = ffx;
+    static int loggedFfx = 0, loggedOutside = 0;
+    if (ffx >= 0 && ffx != loggedFfx) {
+        Log("the game's FidelityFX Super Resolution is %s", ffx ? "on: it sets the render size itself, so the Render "
+                                                                "resolution setting does nothing (Options > Graphics)"
+                                                              : "off again");
+        loggedFfx = ffx;
+    }
+    if (outside < loggedOutside) loggedOutside = 0;  // the script restarted
+    if (outside > 0 && (loggedOutside == 0 || outside >= loggedOutside * 2)) {
+        Log("render scale: something else had set it on %d frame(s) so far; RE2DLSS.lua put %.2f back before rendering", outside,
+            scale);
+        loggedOutside = outside;
+    }
 }
 
 // Full-resolution ray traced reflections, set by the REFramework script (RE2DLSS.lua): the wanted
@@ -2524,6 +2560,7 @@ void UpscalerPresent(swapchain* sc) {
     g_keyWasDown = down;
     g_wasEnabled = g_set.enabled;
     WriteWantedScale();
+    if (WantedScale() > 0) CheckScriptStatus();
     if (!g_samplerStatsLogged && g_frame > 600) {
         g_samplerStatsLogged = true;
         Log("samplers: %u material ones biased by %.2f, %u others", g_samplersBiased.load(), g_mipBias.load(), g_samplersOther.load());
@@ -2630,6 +2667,9 @@ void UpscalerOverlay() {
                                 g_set.mode > 0 && g_set.enabled ? "" : " (the game's slider)");
         else if (g_set.mode > 0)
             ImGui::TextColored(kWarn, "RE2DLSS.lua isn't running: is REFramework installed?");
+        if (g_set.mode > 0 && g_set.enabled && g_fidelityFx.load() == 1)
+            ImGui::TextColored(kWarn, "The game's FidelityFX Super Resolution is on and sets the render size itself:\n"
+                                      "turn it off in Options > Graphics for this setting to work.");
         {
             ImGui::BeginDisabled(ResolvedTech() == Tech::Fsr);
             int model = ModelIndex(g_set.preset);
